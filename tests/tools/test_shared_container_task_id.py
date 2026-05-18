@@ -1,13 +1,12 @@
 """
 Regression tests for the shared-container task_id mapping.
 
-The top-level agent and all delegate_task subagents share a single
-terminal sandbox keyed by ``"default"``.  ``_resolve_container_task_id``
-is the sole gatekeeper for which tool-call task_ids go to the shared
-container vs. get their own isolated sandbox.  RL / benchmark
-environments opt in to isolation by calling
-``register_task_env_overrides(task_id, {...})`` before the agent loop;
-every other task_id collapses back to ``"default"``.
+Calls without a task id and delegate_task subagents share a single
+terminal sandbox keyed by ``"default"``.  Real gateway/cron/API session
+ids keep their own terminal sandbox so concurrent top-level conversations
+do not trample one mutable shell snapshot/cwd.  RL / benchmark
+environments also opt in to isolation by calling
+``register_task_env_overrides(task_id, {...})`` before the agent loop.
 
 If you change the collapse logic, update both the helper and these
 tests -- see `hermes-agent-dev` skill, "Why do subagents get their own
@@ -47,11 +46,18 @@ def test_subagent_task_id_collapses_to_default():
     # should share the parent's container, not spin up their own.
     assert terminal_tool._resolve_container_task_id("subagent-0-deadbeef") == "default"
     assert terminal_tool._resolve_container_task_id("subagent-42-cafef00d") == "default"
+    assert terminal_tool._resolve_container_task_id("sa-0-deadbeef") == "default"
 
 
-def test_arbitrary_session_id_collapses_to_default():
-    # Session UUIDs or anything else without an override still collapse.
-    assert terminal_tool._resolve_container_task_id("sess-123e4567-e89b-12d3") == "default"
+def test_gateway_session_id_keeps_its_own_container():
+    assert (
+        terminal_tool._resolve_container_task_id("20260517_190331_c87b3a47")
+        == "20260517_190331_c87b3a47"
+    )
+    assert (
+        terminal_tool._resolve_container_task_id("sess-123e4567-e89b-12d3")
+        == "sess-123e4567-e89b-12d3"
+    )
 
 
 def test_rl_task_with_override_keeps_its_own_id():
@@ -74,7 +80,7 @@ def test_cleared_override_collapses_again():
     terminal_tool.register_task_env_overrides("tb2-x", {"docker_image": "x:y"})
     assert terminal_tool._resolve_container_task_id("tb2-x") == "tb2-x"
     terminal_tool.clear_task_env_overrides("tb2-x")
-    assert terminal_tool._resolve_container_task_id("tb2-x") == "default"
+    assert terminal_tool._resolve_container_task_id("tb2-x") == "tb2-x"
 
 
 def test_get_active_env_reads_shared_container_from_subagent_id():

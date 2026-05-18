@@ -969,12 +969,14 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     Map a tool-call ``task_id`` to the container/sandbox key used by
     ``_active_environments``.
 
-    The top-level agent passes ``task_id=None`` and lands on ``"default"``.
-    ``delegate_task`` children pass their own subagent ID so that
-    file-state tracking, the active-subagents registry, and TUI events stay
-    distinct per child -- but we deliberately collapse that ID back to
-    ``"default"`` here so subagents share the parent's long-lived container
-    (one bash, one /workspace, one set of installed packages).
+    Calls without a task_id land on ``"default"``. Gateway/cron/API sessions
+    pass stable session ids and must keep their own environment; otherwise two
+    concurrent Telegram topics share one mutable shell snapshot/cwd and file
+    tools can report false "file not found" errors. ``delegate_task`` children
+    pass subagent IDs (``sa-...`` / ``subagent-...``) so file-state tracking,
+    the active-subagents registry, and TUI events stay distinct per child, but
+    we deliberately collapse those IDs back to ``"default"`` so subagents
+    share the parent's long-lived container.
 
     Exception: RL / benchmark environments (TerminalBench2, HermesSweEnv, ...)
     call ``register_task_env_overrides(task_id, {...})`` to request a
@@ -983,9 +985,13 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     rollouts need their own isolated sandbox, which is the whole point of
     the override.
     """
-    if task_id and task_id in _task_env_overrides:
+    if not task_id or task_id == "default":
+        return "default"
+    if task_id in _task_env_overrides:
         return task_id
-    return "default"
+    if task_id.startswith(("sa-", "subagent-")):
+        return "default"
+    return task_id
 
 
 # Configuration from environment variables
