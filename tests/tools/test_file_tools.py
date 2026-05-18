@@ -107,11 +107,12 @@ class TestReadFileHandler:
 
         assert result.error is not None
         assert "Timed out after 3s" in result.error
+        assert "privacy permission prompt" in result.error
 
     @patch("tools.file_tools._using_local_terminal_backend", return_value=True)
     @patch("tools.file_tools._get_file_ops")
     @patch("tools.file_tools._read_local_file_direct")
-    def test_local_backend_timeout_falls_back_to_terminal_reader(
+    def test_local_backend_timeout_returns_direct_error(
         self, mock_direct, mock_get, _mock_local
     ):
         from tools.file_operations import ReadResult
@@ -126,10 +127,11 @@ class TestReadFileHandler:
 
         from tools.file_tools import read_file_tool
 
-        result = json.loads(read_file_tool("/tmp/stalled.md", task_id="fallback"))
+        result = json.loads(read_file_tool("/tmp/stalled.md", task_id="timeout"))
 
-        assert result["content"] == "     1|ok"
-        mock_ops.read_file.assert_called_once_with("/tmp/stalled.md", 1, 500)
+        assert "Timed out after 15s" in result["error"]
+        mock_ops.read_file.assert_not_called()
+        mock_get.assert_not_called()
 
 
 class TestWriteFileHandler:

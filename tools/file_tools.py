@@ -239,8 +239,6 @@ _READ_DEDUP_STATUS_MESSAGE = (
     "the earlier read_file result in this conversation is "
     "still current — refer to that instead of re-reading."
 )
-_LOCAL_DIRECT_READ_TIMEOUT_MARKER = "while opening local file"
-
 
 def _cap_read_tracker_data(task_data: dict) -> None:
     """Enforce size caps on the per-task read-tracker sub-containers.
@@ -665,7 +663,10 @@ print(json.dumps(result, ensure_ascii=False))
         return ReadResult(
             error=(
                 f"Timed out after {timeout:.0f}s while opening local file: {path}. "
-                "The file provider or filesystem may be stalled; retry later or use terminal with a narrow timeout."
+                "On macOS, this often means the process is waiting on a "
+                "Documents/Desktop/iCloud privacy permission prompt for "
+                "uv, Python, or Hermes. Approve the prompt or grant Full "
+                "Disk Access, then retry."
             )
         )
 
@@ -792,13 +793,6 @@ def read_file_tool(
         # ── Perform the read ──────────────────────────────────────────
         if _using_local_terminal_backend():
             result = _read_local_file_direct(_resolved, offset, limit)
-            if result.error and _LOCAL_DIRECT_READ_TIMEOUT_MARKER in result.error:
-                logger.warning(
-                    "local direct read timed out for %s; falling back to terminal reader",
-                    _resolved,
-                )
-                file_ops = _get_file_ops(task_id)
-                result = file_ops.read_file(path, offset, limit)
         else:
             file_ops = _get_file_ops(task_id)
             result = file_ops.read_file(path, offset, limit)
