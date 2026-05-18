@@ -239,6 +239,7 @@ _READ_DEDUP_STATUS_MESSAGE = (
     "the earlier read_file result in this conversation is "
     "still current — refer to that instead of re-reading."
 )
+_LOCAL_DIRECT_READ_TIMEOUT_MARKER = "while opening local file"
 
 
 def _cap_read_tracker_data(task_data: dict) -> None:
@@ -791,6 +792,13 @@ def read_file_tool(
         # ── Perform the read ──────────────────────────────────────────
         if _using_local_terminal_backend():
             result = _read_local_file_direct(_resolved, offset, limit)
+            if result.error and _LOCAL_DIRECT_READ_TIMEOUT_MARKER in result.error:
+                logger.warning(
+                    "local direct read timed out for %s; falling back to terminal reader",
+                    _resolved,
+                )
+                file_ops = _get_file_ops(task_id)
+                result = file_ops.read_file(path, offset, limit)
         else:
             file_ops = _get_file_ops(task_id)
             result = file_ops.read_file(path, offset, limit)

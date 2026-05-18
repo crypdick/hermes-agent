@@ -108,6 +108,29 @@ class TestReadFileHandler:
         assert result.error is not None
         assert "Timed out after 3s" in result.error
 
+    @patch("tools.file_tools._using_local_terminal_backend", return_value=True)
+    @patch("tools.file_tools._get_file_ops")
+    @patch("tools.file_tools._read_local_file_direct")
+    def test_local_backend_timeout_falls_back_to_terminal_reader(
+        self, mock_direct, mock_get, _mock_local
+    ):
+        from tools.file_operations import ReadResult
+
+        mock_direct.return_value = ReadResult(
+            error="Timed out after 15s while opening local file: /tmp/stalled.md"
+        )
+        result_obj = ReadResult(content="     1|ok", total_lines=1)
+        mock_ops = MagicMock()
+        mock_ops.read_file.return_value = result_obj
+        mock_get.return_value = mock_ops
+
+        from tools.file_tools import read_file_tool
+
+        result = json.loads(read_file_tool("/tmp/stalled.md", task_id="fallback"))
+
+        assert result["content"] == "     1|ok"
+        mock_ops.read_file.assert_called_once_with("/tmp/stalled.md", 1, 500)
+
 
 class TestWriteFileHandler:
     @patch("tools.file_tools._get_file_ops")
