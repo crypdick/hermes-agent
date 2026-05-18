@@ -5,6 +5,8 @@ import errno
 import json
 import logging
 import os
+import subprocess
+import sys
 import threading
 from pathlib import Path
 
@@ -535,58 +537,146 @@ def _local_similar_files(path: Path) -> list[str]:
 
 
 def _read_local_file_direct(path: Path, offset: int, limit: int) -> ReadResult:
-    """Read a local file without routing through the terminal shell backend."""
-    try:
-        if not path.is_file():
-            return ReadResult(
-                error=f"File not found: {path}",
-                similar_files=_local_similar_files(path),
-            )
-        file_size = path.stat().st_size
-        sample = path.read_bytes()[:1000]
-        if sample and b"\x00" in sample:
-            return ReadResult(
-                is_binary=True,
-                file_size=file_size,
-                error="Binary file - cannot display as text. Use appropriate tools to handle this file type.",
-            )
-        if sample:
-            non_printable = sum(
-                1 for byte in sample if byte < 32 and byte not in (9, 10, 13)
-            )
-            if non_printable / min(len(sample), 1000) > 0.30:
-                return ReadResult(
-                    is_binary=True,
-                    file_size=file_size,
-                    error="Binary file - cannot display as text. Use appropriate tools to handle this file type.",
-                )
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError as exc:
-        return ReadResult(error=f"Failed to read file: {exc}")
+    """Read a local file without routing through the terminal shell backend.
 
-    lines = text.split("\n")
-    total_lines = len(lines) if text else 0
-    start = max(offset - 1, 0)
-    end = start + limit
+    On macOS, opening a local file can block inside the kernel when a file
+    provider or sync backend stalls. Run the actual open/read in a subprocess
+    so the caller can recover with a bounded error instead of wedging the
+    gateway worker thread indefinitely.
+    """
+    timeout = float(os.getenv("HERMES_LOCAL_READ_TIMEOUT", "15"))
     from tools.tool_output_limits import get_max_line_length
 
-    max_line_length = get_max_line_length()
-    numbered = []
-    for line_number, line in enumerate(lines[start:end], start=offset):
-        if len(line) > max_line_length:
-            line = line[:max_line_length] + "... [truncated]"
-        numbered.append(f"{line_number:6d}|{line}")
-    truncated = total_lines > end
-    hint = None
-    if truncated:
-        hint = f"Use offset={end + 1} to continue reading (showing {offset}-{end} of {total_lines} lines)"
-    return ReadResult(
-        content="\n".join(numbered),
-        total_lines=total_lines,
-        file_size=file_size,
-        truncated=truncated,
-        hint=hint,
-    )
+    child_code = r"""
+import json
+import os
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+offset = int(sys.argv[2])
+limit = int(sys.argv[3])
+max_line_length = int(sys.argv[4])
+
+def similar_files(path):
+    directory = path.parent
+    filename = path.name
+    base = path.stem.lower()
+    lower_name = filename.lower()
+    ext = path.suffix.lower()
+    scored = []
+    try:
+        candidates = list(directory.iterdir())[:50]
+    except OSError:
+        return []
+    for candidate in candidates:
+        name = candidate.name
+        lname = name.lower()
+        score = 0
+        if lname == lower_name:
+            score = 100
+        elif candidate.stem.lower() == base:
+            score = 90
+        elif lname.startswith(lower_name) or lower_name.startswith(lname):
+            score = 70
+        elif lower_name in lname:
+            score = 60
+        elif lname in lower_name and len(lname) > 2:
+            score = 40
+        elif ext and candidate.suffix.lower() == ext:
+            common = set(lower_name) & set(lname)
+            if len(common) >= max(len(lower_name), len(lname)) * 0.4:
+                score = 30
+        if score > 0:
+            scored.append((score, str(candidate)))
+    scored.sort(key=lambda item: -item[0])
+    return [candidate for _, candidate in scored[:5]]
+
+try:
+    if not path.is_file():
+        print(json.dumps({
+            "error": f"File not found: {path}",
+            "similar_files": similar_files(path),
+        }))
+        raise SystemExit(0)
+    file_size = path.stat().st_size
+    sample = path.read_bytes()[:1000]
+    if sample and b"\x00" in sample:
+        print(json.dumps({
+            "is_binary": True,
+            "file_size": file_size,
+            "error": "Binary file - cannot display as text. Use appropriate tools to handle this file type.",
+        }))
+        raise SystemExit(0)
+    if sample:
+        non_printable = sum(
+            1 for byte in sample if byte < 32 and byte not in (9, 10, 13)
+        )
+        if non_printable / min(len(sample), 1000) > 0.30:
+            print(json.dumps({
+                "is_binary": True,
+                "file_size": file_size,
+                "error": "Binary file - cannot display as text. Use appropriate tools to handle this file type.",
+            }))
+            raise SystemExit(0)
+    text = path.read_text(encoding="utf-8", errors="replace")
+except OSError as exc:
+    print(json.dumps({"error": f"Failed to read file: {exc}"}))
+    raise SystemExit(0)
+
+lines = text.split("\n")
+total_lines = len(lines) if text else 0
+start = max(offset - 1, 0)
+end = start + limit
+numbered = []
+for line_number, line in enumerate(lines[start:end], start=offset):
+    if len(line) > max_line_length:
+        line = line[:max_line_length] + "... [truncated]"
+    numbered.append(f"{line_number:6d}|{line}")
+truncated = total_lines > end
+result = {
+    "content": "\n".join(numbered),
+    "total_lines": total_lines,
+    "file_size": file_size,
+    "truncated": truncated,
+}
+if truncated:
+    result["hint"] = f"Use offset={end + 1} to continue reading (showing {offset}-{end} of {total_lines} lines)"
+print(json.dumps(result, ensure_ascii=False))
+"""
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                child_code,
+                str(path),
+                str(offset),
+                str(limit),
+                str(get_max_line_length()),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return ReadResult(
+            error=(
+                f"Timed out after {timeout:.0f}s while opening local file: {path}. "
+                "The file provider or filesystem may be stalled; retry later or use terminal with a narrow timeout."
+            )
+        )
+
+    if completed.returncode != 0:
+        err = completed.stderr.strip() or f"exit code {completed.returncode}"
+        return ReadResult(error=f"Failed to read file: {err}")
+
+    try:
+        result = json.loads(completed.stdout)
+    except json.JSONDecodeError:
+        return ReadResult(error="Failed to parse local read subprocess output")
+    return ReadResult(**result)
 
 
 def read_file_tool(

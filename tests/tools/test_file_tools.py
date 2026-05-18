@@ -6,6 +6,7 @@ handling without requiring a running terminal environment.
 
 import json
 import logging
+import subprocess
 from unittest.mock import MagicMock, patch
 
 from tools.file_tools import (
@@ -94,6 +95,18 @@ class TestReadFileHandler:
         assert result["content"] == "     2|beta"
         assert result["total_lines"] == 4
         mock_get.assert_not_called()
+
+    @patch("tools.file_tools.subprocess.run")
+    def test_local_backend_read_timeout_returns_error(self, mock_run, monkeypatch):
+        mock_run.side_effect = subprocess.TimeoutExpired(["python"], timeout=3)
+        monkeypatch.setenv("HERMES_LOCAL_READ_TIMEOUT", "3")
+
+        from tools.file_tools import _read_local_file_direct
+
+        result = _read_local_file_direct("/tmp/stalled.md", offset=1, limit=10)
+
+        assert result.error is not None
+        assert "Timed out after 3s" in result.error
 
 
 class TestWriteFileHandler:
