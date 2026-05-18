@@ -133,6 +133,29 @@ class TestReadFileHandler:
         mock_ops.read_file.assert_not_called()
         mock_get.assert_not_called()
 
+    @patch("tools.file_tools._using_local_terminal_backend", return_value=True)
+    @patch("tools.file_tools._read_local_file_direct")
+    def test_failed_read_does_not_seed_dedup_cache(self, mock_direct, _mock_local, tmp_path):
+        from tools.file_operations import ReadResult
+        from tools.file_tools import read_file_tool, reset_file_dedup
+
+        file_path = tmp_path / "notes.md"
+        file_path.write_text("alpha\nbeta\n", encoding="utf-8")
+        task_id = "failed-read-dedup"
+        reset_file_dedup(task_id)
+        mock_direct.side_effect = [
+            ReadResult(error=f"File not found: {file_path}"),
+            ReadResult(content="     1|alpha", total_lines=3, file_size=11, truncated=True),
+        ]
+
+        first = json.loads(read_file_tool(str(file_path), offset=1, limit=1, task_id=task_id))
+        second = json.loads(read_file_tool(str(file_path), offset=1, limit=1, task_id=task_id))
+
+        assert "File not found" in first["error"]
+        assert second["content"] == "     1|alpha"
+        assert second.get("status") != "unchanged"
+        assert mock_direct.call_count == 2
+
 
 class TestWriteFileHandler:
     @patch("tools.file_tools._get_file_ops")

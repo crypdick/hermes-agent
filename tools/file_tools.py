@@ -798,6 +798,14 @@ def read_file_tool(
             result = file_ops.read_file(path, offset, limit)
         result_dict = result.to_dict()
 
+        # If the read failed, return the error immediately and DO NOT seed
+        # dedup/staleness trackers. A failed read (for example a transient
+        # macOS TCC/iCloud "File not found"/timeout) is not proof the model
+        # has seen the content. Caching its mtime would make a retry return
+        # the lightweight "unchanged" stub instead of the actual file bytes.
+        if result.error:
+            return json.dumps(result_dict, ensure_ascii=False)
+
         # ── Character-count guard ─────────────────────────────────────
         # We're model-agnostic so we can't count tokens; characters are
         # the best proxy we have.  If the read produced an unreasonable
