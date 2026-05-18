@@ -28,6 +28,7 @@ Usage:
 import os
 import re
 import difflib
+import threading
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
@@ -539,6 +540,7 @@ class ShellFileOperations(FileOperations):
         # If nothing provides a cwd, use "/" as a safe universal default.
         self.cwd = cwd or getattr(terminal_env, 'cwd', None) or \
                    getattr(getattr(terminal_env, 'config', None), 'cwd', None) or "/"
+        self._exec_lock = threading.RLock()
 
         # Cache for command availability checks
         self._command_cache: Dict[str, bool] = {}
@@ -569,7 +571,8 @@ class ShellFileOperations(FileOperations):
         # Resolve cwd from the live env so `cd` commands are picked up.
         # Fall through to init-time self.cwd only if the env doesn't track cwd.
         effective_cwd = cwd or getattr(self.env, 'cwd', None) or self.cwd
-        result = self.env.execute(command, cwd=effective_cwd, **kwargs)
+        with self._exec_lock:
+            result = self.env.execute(command, cwd=effective_cwd, **kwargs)
         return ExecuteResult(
             stdout=result.get("output", ""),
             exit_code=result.get("returncode", 0)
