@@ -552,6 +552,40 @@ class TestPatchReplacePostWriteVerification:
         assert result.success is True
         assert state["content"] == "hi world\n", f"File not actually updated: {state['content']!r}"
 
+    def test_patch_replace_allows_obsidian_updated_timestamp_mutation(self, mock_env):
+        """Obsidian may rewrite auto-managed frontmatter timestamps after writes."""
+        state = {
+            "content": "---\ncreated: 2026-05-17T23:00\nupdated: 2026-05-17T23:00\n---\nhello world\n",
+            "reads": 0,
+        }
+
+        def side_effect(command, stdin_data=None, **kwargs):
+            if command.startswith("cat >"):
+                if stdin_data is not None:
+                    state["content"] = stdin_data
+                return {"output": "", "returncode": 0}
+            if command.startswith("cat "):
+                state["reads"] += 1
+                if state["reads"] >= 2:
+                    mutated = state["content"].replace(
+                        "updated: 2026-05-17T23:00",
+                        "updated: 2026-05-17T23:01",
+                    )
+                    return {"output": mutated, "returncode": 0}
+                return {"output": state["content"], "returncode": 0}
+            if command.startswith("mkdir "):
+                return {"output": "", "returncode": 0}
+            if command.startswith("wc -c"):
+                return {"output": str(len(state["content"].encode())), "returncode": 0}
+            return {"output": "", "returncode": 0}
+
+        mock_env.execute.side_effect = side_effect
+        ops = ShellFileOperations(mock_env)
+        result = ops.patch_replace("/tmp/test/a.md", "hello", "hi")
+
+        assert result.error is None, f"Unexpected error: {result.error}"
+        assert result.success is True
+
     def test_patch_replace_fails_when_verify_read_errors(self, mock_env):
         """If the verify-read step itself fails (exit code != 0), return an error."""
         call_count = {"cat": 0}

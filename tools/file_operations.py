@@ -56,6 +56,33 @@ WRITE_DENIED_PREFIXES = build_write_denied_prefixes(_HOME)
 
 _OSC_SEQUENCE_RE = re.compile(r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)")
 _FENCE_MARKER_RE = re.compile(r"'?\x07?__HERMES_FENCE_[A-Za-z0-9]+__\x07?'?")
+_FRONTMATTER_TIMESTAMP_RE = re.compile(r"^(created|updated):\s*.*$", re.MULTILINE)
+
+
+def _normalize_auto_frontmatter_timestamps(text: str) -> str:
+    """Mask Obsidian-managed frontmatter timestamps for write verification.
+
+    Obsidian/Linter may update ``created`` or ``updated`` immediately after a
+    write. That means the write did persist, but a byte-for-byte reread differs
+    by an auto-managed metadata line. Only mask those keys inside the leading
+    YAML frontmatter block; content-body differences still fail verification.
+    """
+    if not text.startswith("---"):
+        return text
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].strip() != "---":
+        return text
+    end_idx = None
+    for i, line in enumerate(lines[1:], start=1):
+        if line.strip() == "---":
+            end_idx = i
+            break
+    if end_idx is None:
+        return text
+    frontmatter = "".join(lines[: end_idx + 1])
+    body = "".join(lines[end_idx + 1 :])
+    frontmatter = _FRONTMATTER_TIMESTAMP_RE.sub(r"\1: <auto-managed>", frontmatter)
+    return frontmatter + body
 
 
 def _strip_terminal_fence_leaks(text: str) -> str:
@@ -1071,13 +1098,20 @@ class ShellFileOperations(FileOperations):
         _verify_stdout_normalized = verify_result.stdout.replace("\r\n", "\n").replace("\r", "\n")
         _new_content_normalized = new_content.replace("\r\n", "\n").replace("\r", "\n")
         if _verify_stdout_normalized != _new_content_normalized:
-            return PatchResult(error=(
-                f"Post-write verification failed for {path}: on-disk content "
-                f"differs from intended write "
-                f"(wrote {len(_new_content_normalized)} chars, read back "
-                f"{len(_verify_stdout_normalized)} chars after normalizing line endings). "
-                "The patch did not persist. Re-read the file and try again."
-            ))
+            _verify_auto_normalized = _normalize_auto_frontmatter_timestamps(
+                _verify_stdout_normalized
+            )
+            _new_auto_normalized = _normalize_auto_frontmatter_timestamps(
+                _new_content_normalized
+            )
+            if _verify_auto_normalized != _new_auto_normalized:
+                return PatchResult(error=(
+                    f"Post-write verification failed for {path}: on-disk content "
+                    f"differs from intended write "
+                    f"(wrote {len(_new_content_normalized)} chars, read back "
+                    f"{len(_verify_stdout_normalized)} chars after normalizing line endings). "
+                    "The patch did not persist. Re-read the file and try again."
+                ))
 
         # Generate diff
         diff = self._unified_diff(content, new_content, path)
