@@ -1872,10 +1872,10 @@ class TestConcurrentToolExecution:
                 mock_seq.assert_called_once()
                 mock_con.assert_not_called()
 
-    def test_multiple_tools_uses_concurrent_path(self, agent):
-        """Multiple read-only tools should use concurrent path."""
+    def test_multiple_read_only_network_tools_use_concurrent_path(self, agent):
+        """Multiple stateless read-only tools should use concurrent path."""
         tc1 = _mock_tool_call(name="web_search", arguments='{}', call_id="c1")
-        tc2 = _mock_tool_call(name="read_file", arguments='{"path":"x.py"}', call_id="c2")
+        tc2 = _mock_tool_call(name="web_extract", arguments='{}', call_id="c2")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
         messages = []
         with patch.object(agent, "_execute_tool_calls_sequential") as mock_seq:
@@ -1883,6 +1883,18 @@ class TestConcurrentToolExecution:
                 agent._execute_tool_calls(mock_msg, messages, "task-1")
                 mock_con.assert_called_once()
                 mock_seq.assert_not_called()
+
+    def test_file_read_batch_forces_sequential(self, agent):
+        """Shell-backed file reads share task environment state and must stay ordered."""
+        tc1 = _mock_tool_call(name="web_search", arguments='{}', call_id="c1")
+        tc2 = _mock_tool_call(name="read_file", arguments='{"path":"x.py"}', call_id="c2")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
+        messages = []
+        with patch.object(agent, "_execute_tool_calls_sequential") as mock_seq:
+            with patch.object(agent, "_execute_tool_calls_concurrent") as mock_con:
+                agent._execute_tool_calls(mock_msg, messages, "task-1")
+                mock_seq.assert_called_once()
+                mock_con.assert_not_called()
 
     def test_terminal_batch_forces_sequential(self, agent):
         """Stateful tools should not share the concurrent execution path."""
