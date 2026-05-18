@@ -53,6 +53,23 @@ logger = logging.getLogger(__name__)
 # Maximum number of concurrent worker threads for parallel tool execution.
 # Mirrors the constant in ``run_agent`` for tests/imports that look here.
 _MAX_TOOL_WORKERS = 8
+_DEFAULT_CONCURRENT_TOOL_BATCH_TIMEOUT_SECONDS = 600.0
+
+
+def _concurrent_tool_batch_timeout_seconds() -> float:
+    raw = os.getenv("HERMES_CONCURRENT_TOOL_BATCH_TIMEOUT", "").strip()
+    if not raw:
+        return _DEFAULT_CONCURRENT_TOOL_BATCH_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning(
+            "Invalid HERMES_CONCURRENT_TOOL_BATCH_TIMEOUT=%r; using %.0fs",
+            raw,
+            _DEFAULT_CONCURRENT_TOOL_BATCH_TIMEOUT_SECONDS,
+        )
+        return _DEFAULT_CONCURRENT_TOOL_BATCH_TIMEOUT_SECONDS
+    return max(0.0, value)
 
 
 def _ra():
@@ -285,12 +302,15 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         futures = []
         if runnable_calls:
             max_workers = min(len(runnable_calls), _MAX_TOOL_WORKERS)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+            try:
+                future_names: dict[concurrent.futures.Future, str] = {}
                 for i, tc, name, args in runnable_calls:
                     # Propagate ContextVars (e.g. _approval_session_key); mirrors asyncio.to_thread.
                     ctx = contextvars.copy_context()
                     f = executor.submit(ctx.run, _run_tool, i, tc, name, args)
                     futures.append(f)
+                    future_names[f] = name
 
                 # Wait for all to complete with periodic heartbeats so the
                 # gateway's inactivity monitor doesn't kill us during long
@@ -298,10 +318,16 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 # so we don't block indefinitely when the user sends /stop
                 # or a new message during concurrent tool execution.
                 _conc_start = time.time()
+                _batch_timeout = _concurrent_tool_batch_timeout_seconds()
                 _interrupt_logged = False
+                _timeout_logged = False
                 while True:
+                    _wait_timeout = 5.0
+                    if _batch_timeout > 0:
+                        _remaining = _batch_timeout - (time.time() - _conc_start)
+                        _wait_timeout = max(0.0, min(_wait_timeout, _remaining))
                     done, not_done = concurrent.futures.wait(
-                        futures, timeout=5.0,
+                        futures, timeout=_wait_timeout,
                     )
                     if not not_done:
                         break
@@ -326,18 +352,45 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         concurrent.futures.wait(not_done, timeout=3.0)
                         break
 
-                    _conc_elapsed = int(time.time() - _conc_start)
+                    _conc_elapsed_raw = time.time() - _conc_start
+                    _conc_elapsed = int(_conc_elapsed_raw)
+                    if _batch_timeout > 0 and _conc_elapsed_raw >= _batch_timeout:
+                        if not _timeout_logged:
+                            _timeout_logged = True
+                            _still_running = [
+                                future_names.get(f, "unknown")
+                                for f in not_done
+                            ]
+                            logger.error(
+                                "Concurrent tool batch timed out after %.1fs; "
+                                "cancelling %d unfinished tool(s): %s",
+                                _conc_elapsed_raw,
+                                len(not_done),
+                                ", ".join(_still_running[:8]),
+                            )
+                            agent._touch_activity(
+                                f"concurrent tool batch timeout after "
+                                f"{_conc_elapsed}s ({len(not_done)} unfinished)"
+                            )
+                        for f in not_done:
+                            f.cancel()
+                        break
+
                     # Heartbeat every ~30s (6 × 5s poll intervals)
                     if _conc_elapsed > 0 and _conc_elapsed % 30 < 6:
                         _still_running = [
-                            parsed_calls[futures.index(f)][1]
+                            future_names.get(f, "unknown")
                             for f in not_done
-                            if f in futures
                         ]
                         agent._touch_activity(
                             f"concurrent tools running ({_conc_elapsed}s, "
                             f"{len(not_done)} remaining: {', '.join(_still_running[:3])})"
                         )
+            finally:
+                # Do not let ThreadPoolExecutor.__exit__ wait forever on a
+                # wedged tool worker. The conversation loop must receive
+                # synthetic tool errors for unfinished calls and continue.
+                executor.shutdown(wait=False, cancel_futures=True)
     finally:
         if spinner:
             # Build a summary message for the spinner stop

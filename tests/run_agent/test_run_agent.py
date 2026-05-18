@@ -2047,6 +2047,32 @@ class TestConcurrentToolExecution:
         # Second tool should succeed
         assert "success" in messages[1]["content"]
 
+    def test_concurrent_batch_timeout_returns_tool_errors(self, agent, monkeypatch):
+        """A hung concurrent tool must not wedge the whole conversation turn."""
+        import time as _time
+
+        monkeypatch.setenv("HERMES_CONCURRENT_TOOL_BATCH_TIMEOUT", "0.05")
+        tc1 = _mock_tool_call(name="web_search", arguments='{"q":"slow"}', call_id="c1")
+        tc2 = _mock_tool_call(name="web_search", arguments='{"q":"fast"}', call_id="c2")
+        mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
+        messages = []
+
+        def fake_handle(name, args, task_id, **kwargs):
+            if args.get("q") == "slow":
+                _time.sleep(0.2)
+            return f"result_{args.get('q')}"
+
+        started_at = _time.monotonic()
+        with patch("run_agent.handle_function_call", side_effect=fake_handle):
+            agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
+
+        assert _time.monotonic() - started_at < 0.18
+        assert len(messages) == 2
+        assert messages[0]["tool_call_id"] == "c1"
+        assert "thread did not return" in messages[0]["content"]
+        assert messages[1]["tool_call_id"] == "c2"
+        assert "result_fast" in messages[1]["content"]
+
     def test_concurrent_interrupt_before_start(self, agent):
         """If interrupt is requested before concurrent execution, all tools are skipped."""
         tc1 = _mock_tool_call(name="web_search", arguments='{}', call_id="c1")
