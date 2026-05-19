@@ -63,6 +63,7 @@ def _make_runner():
     runner._running_agents = {}
     runner._running_agents_ts = {}
     runner._pending_messages = {}
+    runner._queued_events = {}
     runner._busy_ack_ts = {}
     runner._draining = False
     runner.adapters = {}
@@ -117,6 +118,50 @@ class TestBusySessionAck:
         assert adapter._pending_messages[sk] is event
         assert sk not in runner._pending_messages
         running_agent.interrupt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_btw_prefix_queues_without_interrupt_even_in_interrupt_mode(self):
+        """Plaintext `btw ...` should behave like /queue while busy."""
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        adapter = _make_adapter()
+
+        event = _make_event(text="btw check the logs after this")
+        sk = build_session_key(event.source)
+
+        running_agent = MagicMock()
+        runner._running_agents[sk] = running_agent
+        runner.adapters[event.source.platform] = adapter
+
+        result = await runner._handle_active_session_busy_message(event, sk)
+
+        assert result is True
+        running_agent.interrupt.assert_not_called()
+        assert sk in adapter._pending_messages
+        assert adapter._pending_messages[sk].text == "check the logs after this"
+        adapter._send_with_retry.assert_called_once()
+        content = adapter._send_with_retry.call_args.kwargs.get("content", "")
+        assert "Queued for the next turn" in content
+
+    @pytest.mark.asyncio
+    async def test_btw_prefix_uses_fifo_for_multiple_messages(self):
+        """Repeated `btw ...` messages stack like repeated /queue commands."""
+        runner, _sentinel = _make_runner()
+        runner._busy_input_mode = "interrupt"
+        adapter = _make_adapter()
+
+        first_event = _make_event(text="btw first")
+        second_event = _make_event(text="BTW: second")
+        second_event.source = first_event.source
+        sk = build_session_key(first_event.source)
+        runner._running_agents[sk] = MagicMock()
+        runner.adapters[first_event.source.platform] = adapter
+
+        await runner._handle_active_session_busy_message(first_event, sk)
+        await runner._handle_active_session_busy_message(second_event, sk)
+
+        assert adapter._pending_messages[sk].text == "first"
+        assert [ev.text for ev in runner._queued_events[sk]] == ["second"]
 
     @pytest.mark.asyncio
     async def test_sends_ack_when_agent_running(self):

@@ -2557,11 +2557,48 @@ class GatewayRunner:
             if agent is not _AGENT_PENDING_SENTINEL
         }
 
+    @staticmethod
+    def _extract_btw_queue_payload(text: str | None) -> str | None:
+        """Return payload for the plaintext ``btw`` queue prefix, if present.
+
+        ``btw <prompt>`` is a gateway-friendly alias for ``/queue <prompt>``
+        when a session is busy.  Require a word boundary after ``btw`` so words
+        like ``btwenty`` remain normal messages; accept common punctuation used
+        in chat (``btw:`` / ``btw,``) as separators.
+        """
+        stripped = (text or "").strip()
+        if not stripped:
+            return None
+        lowered = stripped.lower()
+        if lowered == "btw":
+            return ""
+        if len(stripped) <= 3 or lowered[:3] != "btw":
+            return None
+        sep = stripped[3]
+        if sep.isspace() or sep in {":", ","}:
+            return stripped[4:].strip()
+        return None
+
     def _queue_or_replace_pending_event(self, session_key: str, event: MessageEvent) -> None:
         adapter = self.adapters.get(event.source.platform)
         if not adapter:
             return
         merge_pending_message_event(adapter._pending_messages, session_key, event)
+
+    def _enqueue_plaintext_queue_event(self, session_key: str, event: MessageEvent, queued_text: str) -> int:
+        """Queue a plaintext-prefixed follow-up with /queue FIFO semantics."""
+        adapter = self.adapters.get(event.source.platform)
+        if not adapter:
+            return 0
+        queued_event = MessageEvent(
+            text=queued_text,
+            message_type=MessageType.TEXT,
+            source=event.source,
+            message_id=event.message_id,
+            channel_prompt=event.channel_prompt,
+        )
+        self._enqueue_fifo(session_key, queued_event, adapter)
+        return self._queue_depth(session_key, adapter=adapter)
 
     async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
         # --- Authorization gate (#17775) ---
@@ -2614,6 +2651,34 @@ class GatewayRunner:
             return False  # let default path handle it
 
         running_agent = self._running_agents.get(session_key)
+
+        btw_queue_payload = self._extract_btw_queue_payload(event.text)
+        if btw_queue_payload is not None:
+            if not btw_queue_payload:
+                message = "Usage: btw <prompt>"
+            else:
+                depth = self._enqueue_plaintext_queue_event(session_key, event, btw_queue_payload)
+                message = "Queued for the next turn." if depth <= 1 else f"Queued for the next turn. ({depth} queued)"
+            if os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() != "true":
+                return True
+            reply_anchor = self._reply_anchor_for_event(event)
+            thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
+            try:
+                await adapter._send_with_retry(
+                    chat_id=event.source.chat_id,
+                    content=message,
+                    reply_to=(
+                        reply_anchor
+                        if event.source.platform == Platform.TELEGRAM
+                        and event.source.chat_type == "dm"
+                        and event.source.thread_id
+                        else (None if event.source.platform == Platform.TELEGRAM and event.source.thread_id else event.message_id)
+                    ),
+                    metadata=thread_meta,
+                )
+            except Exception as e:
+                logger.debug("Failed to send btw queue ack: %s", e)
+            return True
 
         # Steer mode: inject mid-run via running_agent.steer() instead of
         # queueing + interrupting.  If the agent isn't running yet
@@ -6248,10 +6313,15 @@ class GatewayRunner:
             # Semantics: each /queue invocation produces its own full agent
             # turn, processed in FIFO order after the current run (and any
             # earlier /queue items) finishes.  Messages are NOT merged.
-            if event.get_command() in {"queue", "q"}:
-                queued_text = event.get_command_args().strip()
+            btw_queue_payload = self._extract_btw_queue_payload(event.text)
+            if event.get_command() in {"queue", "q"} or btw_queue_payload is not None:
+                queued_text = (
+                    btw_queue_payload
+                    if btw_queue_payload is not None
+                    else event.get_command_args().strip()
+                )
                 if not queued_text:
-                    return "Usage: /queue <prompt>"
+                    return "Usage: btw <prompt>" if btw_queue_payload is not None else "Usage: /queue <prompt>"
                 adapter = self.adapters.get(source.platform)
                 if adapter:
                     queued_event = MessageEvent(
