@@ -112,6 +112,46 @@ def test_closed_shared_client_is_recreated_before_request(monkeypatch):
     assert len(factory.calls) == 2
 
 
+def test_late_non_stream_worker_completion_is_logged_after_stale_timeout(monkeypatch, caplog):
+    response_can_finish = threading.Event()
+
+    def slow_responder(**kwargs):
+        response_can_finish.wait()
+        return {"ok": "late"}
+
+    request_client = FakeRequestClient(slow_responder)
+    factory = OpenAIFactory([request_client])
+    monkeypatch.setattr(run_agent, "OpenAI", factory)
+
+    agent = _build_agent()
+
+    def compute_timeout(messages):
+        return 0.01
+
+    def emit_status(message):
+        return None
+
+    def touch_activity(desc):
+        return None
+
+    monkeypatch.setattr(agent, "_compute_non_stream_stale_timeout", compute_timeout)
+    monkeypatch.setattr(agent, "_emit_status", emit_status)
+    monkeypatch.setattr(agent, "_touch_activity", touch_activity)
+
+    with caplog.at_level("WARNING"):
+        with pytest.raises(TimeoutError):
+            agent._interruptible_api_call({"model": "gpt-5-codex", "messages": []})
+        response_can_finish.set()
+        for _ in range(50):
+            if "Late non-streaming API worker finished after stale timeout" in caplog.text:
+                break
+            threading.Event().wait(0.02)
+
+    assert "Late non-streaming API worker finished after stale timeout" in caplog.text
+    assert "outcome=response" in caplog.text
+    assert "model=gpt-5-codex" in caplog.text
+
+
 def test_concurrent_requests_do_not_break_each_other_when_one_client_closes(monkeypatch):
     first_started = threading.Event()
     first_closed = threading.Event()

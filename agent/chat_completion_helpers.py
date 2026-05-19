@@ -92,6 +92,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
     """
     result = {"response": None, "error": None}
     request_client_holder = {"client": None}
+    request_id = uuid.uuid4().hex[:8]
+    late_worker_state = {
+        "stale_killed": False,
+        "kill_elapsed": None,
+        "context_tokens": None,
+    }
+    worker_state = {"outcome": "unknown", "error_type": None}
 
     def _call():
         try:
@@ -136,12 +143,36 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     api_kwargs=api_kwargs,
                 )
                 result["response"] = request_client_holder["client"].chat.completions.create(**api_kwargs)
+            worker_state["outcome"] = "response"
         except Exception as e:
+            worker_state["outcome"] = "error"
+            worker_state["error_type"] = type(e).__name__
             result["error"] = e
         finally:
+            worker_finished = time.time()
             request_client = request_client_holder.get("client")
             if request_client is not None:
                 agent._close_request_openai_client(request_client, reason="request_complete")
+            if late_worker_state["stale_killed"]:
+                kill_elapsed = late_worker_state.get("kill_elapsed")
+                late_after_kill = (
+                    worker_finished - (_call_start + kill_elapsed)
+                    if isinstance(kill_elapsed, (int, float))
+                    else None
+                )
+                logger.warning(
+                    "Late non-streaming API worker finished after stale timeout. "
+                    "request_id=%s model=%s outcome=%s error_type=%s "
+                    "total_elapsed=%.1fs late_after_kill=%.1fs threshold=%.1fs context=~%s tokens",
+                    request_id,
+                    api_kwargs.get("model", "unknown"),
+                    worker_state.get("outcome", "unknown"),
+                    worker_state.get("error_type"),
+                    worker_finished - _call_start,
+                    late_after_kill if late_after_kill is not None else -1.0,
+                    _stale_timeout,
+                    f"{late_worker_state.get('context_tokens') or 0:,}",
+                )
 
     # ── Stale-call timeout (mirrors streaming stale detector) ────────
     # Non-streaming calls return nothing until the full response is
@@ -176,10 +207,14 @@ def interruptible_api_call(agent, api_kwargs: dict):
         _elapsed = time.time() - _call_start
         if _elapsed > _stale_timeout:
             _est_ctx = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
+            late_worker_state["stale_killed"] = True
+            late_worker_state["kill_elapsed"] = _elapsed
+            late_worker_state["context_tokens"] = _est_ctx
             logger.warning(
                 "Non-streaming API call stale for %.0fs (threshold %.0fs). "
-                "model=%s context=~%s tokens. Killing connection.",
+                "request_id=%s model=%s context=~%s tokens. Killing connection.",
                 _elapsed, _stale_timeout,
+                request_id,
                 api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
             )
             agent._emit_status(
