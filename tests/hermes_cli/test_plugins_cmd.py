@@ -37,6 +37,20 @@ class TestSanitizePluginName:
         target = _sanitize_plugin_name("plugin-v2", tmp_path)
         assert target.name == "plugin-v2"
 
+    def test_allows_named_symlink_to_external_checkout(self, tmp_path):
+        plugins_dir = tmp_path / "plugins"
+        plugins_dir.mkdir()
+        checkout = tmp_path / "external" / "obsidian-knowledge"
+        checkout.mkdir(parents=True)
+        link = plugins_dir / "obsidian-knowledge"
+        link.symlink_to(checkout, target_is_directory=True)
+
+        target = _sanitize_plugin_name("obsidian-knowledge", plugins_dir)
+
+        assert target == link
+        assert target.is_dir()
+        assert target.resolve() == checkout
+
     def test_rejects_dot_dot(self, tmp_path):
         with pytest.raises(ValueError, match="must not contain"):
             _sanitize_plugin_name("../../etc/passwd", tmp_path)
@@ -154,6 +168,26 @@ class TestResolveGitExecutable:
         assert ok is True
         run.assert_called_once()
         assert run.call_args[0][0][0] == "/resolved/git"
+
+    def test_git_pull_accepts_symlink_checkout(self, tmp_path):
+        import hermes_cli.plugins_cmd as pc
+
+        plugins_dir = tmp_path / "plugins"
+        plugins_dir.mkdir()
+        checkout = tmp_path / "external" / "obsidian-knowledge"
+        checkout.mkdir(parents=True)
+        (checkout / ".git").mkdir()
+        link = plugins_dir / "obsidian-knowledge"
+        link.symlink_to(checkout, target_is_directory=True)
+
+        with patch.object(pc, "_resolve_git_executable", return_value="/resolved/git"):
+            with patch.object(pc.subprocess, "run") as run:
+                run.return_value = MagicMock(returncode=0, stdout="Already up to date\n", stderr="")
+                ok, msg = pc._git_pull_plugin_dir(link)
+
+        assert ok is True
+        assert "Already up to date" in msg
+        assert run.call_args.kwargs["cwd"] == str(link)
 
     def test_install_core_raises_when_git_unresolved(self):
         import hermes_cli.plugins_cmd as pc

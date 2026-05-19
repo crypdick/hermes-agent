@@ -95,17 +95,21 @@ def _sanitize_plugin_name(name: str, plugins_dir: Path) -> Path:
         if bad in name:
             raise ValueError(f"Invalid plugin name '{name}': must not contain '{bad}'.")
 
-    target = (plugins_dir / name).resolve()
+    target = plugins_dir / name
     plugins_resolved = plugins_dir.resolve()
 
-    if target == plugins_resolved:
+    # Validate the lexical path before resolving symlinks. Installed plugins may
+    # intentionally be symlinks to local development checkouts outside
+    # ~/.hermes/plugins; resolving here would reject those safe, named entries
+    # and break `hermes plugins update <name>`.
+    try:
+        target.parent.resolve().relative_to(plugins_resolved)
+    except ValueError:
         raise ValueError(
-            f"Invalid plugin name '{name}': resolves to the plugins directory itself."
+            f"Invalid plugin name '{name}': resolves outside the plugins directory."
         )
 
-    try:
-        target.relative_to(plugins_resolved)
-    except ValueError:
+    if target.parent.resolve() != plugins_resolved:
         raise ValueError(
             f"Invalid plugin name '{name}': resolves outside the plugins directory."
         )
