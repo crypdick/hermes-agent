@@ -851,11 +851,13 @@ def _get_approval_timeout() -> int:
 
 
 def _get_cron_approval_mode() -> str:
-    """Read the cron approval mode from config. Returns 'deny' or 'approve'."""
+    """Read the cron approval mode from config. Returns 'deny', 'smart', or 'approve'."""
     try:
         from hermes_cli.config import load_config
         config = load_config()
         mode = str(cfg_get(config, "approvals", "cron_mode", default="deny")).lower().strip()
+        if mode == "smart":
+            return "smart"
         if mode in {"approve", "off", "allow", "yes"}:
             return "approve"
         return "deny"
@@ -910,6 +912,33 @@ Respond with exactly one word: APPROVE, DENY, or ESCALATE"""
         return "escalate"
 
 
+def _cron_smart_approval_result(command: str, description: str) -> dict:
+    """Apply smart approval in cron and fail closed when the LLM is uncertain."""
+    verdict = _smart_approve(command, description)
+    if verdict == "approve":
+        return {
+            "approved": True,
+            "message": None,
+            "smart_approved": True,
+            "description": description,
+        }
+    if verdict == "deny":
+        return {
+            "approved": False,
+            "message": f"BLOCKED by smart approval: {description}. "
+                       "The command was assessed as genuinely dangerous. Do NOT retry.",
+            "smart_denied": True,
+            "description": description,
+        }
+    return {
+        "approved": False,
+        "message": f"BLOCKED: Smart approval was uncertain about this cron command ({description}). "
+                   "Cron jobs run without a user present, so uncertain approvals fail closed.",
+        "smart_escalated": True,
+        "description": description,
+    }
+
+
 def check_dangerous_command(command: str, env_type: str,
                             approval_callback=None) -> dict:
     """Check if a command is dangerous and handle approval.
@@ -957,7 +986,8 @@ def check_dangerous_command(command: str, env_type: str,
     if not is_cli and not is_gateway:
         # Cron sessions: respect cron_mode config
         if env_var_enabled("HERMES_CRON_SESSION"):
-            if _get_cron_approval_mode() == "deny":
+            cron_mode = _get_cron_approval_mode()
+            if cron_mode == "deny":
                 return {
                     "approved": False,
                     "message": (
@@ -968,6 +998,8 @@ def check_dangerous_command(command: str, env_type: str,
                         "approvals.cron_mode: approve in config.yaml."
                     ),
                 }
+            if cron_mode == "smart":
+                return _cron_smart_approval_result(command, description)
         return {"approved": True, "message": None}
 
     if is_gateway or env_var_enabled("HERMES_EXEC_ASK"):
@@ -1084,11 +1116,14 @@ def check_all_command_guards(command: str, env_type: str,
     is_ask = env_var_enabled("HERMES_EXEC_ASK")
 
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
-    # flows, we do not block on approvals and we skip external guard work.
-    if not is_cli and not is_gateway and not is_ask:
+    # flows, we do not block on approvals and we skip external guard work,
+    # except cron smart mode which deliberately uses the smart approval gate.
+    cron_mode = _get_cron_approval_mode() if env_var_enabled("HERMES_CRON_SESSION") else ""
+    cron_smart_mode = cron_mode == "smart"
+    if not is_cli and not is_gateway and not is_ask and not cron_smart_mode:
         # Cron sessions: respect cron_mode config
         if env_var_enabled("HERMES_CRON_SESSION"):
-            if _get_cron_approval_mode() == "deny":
+            if cron_mode == "deny":
                 # Run detection to get a description for the block message
                 is_dangerous, _pk, description = detect_dangerous_command(command)
                 if is_dangerous:
@@ -1147,9 +1182,11 @@ def check_all_command_guards(command: str, env_type: str,
 
     # --- Phase 2.5: Smart approval (auxiliary LLM risk assessment) ---
     # When approvals.mode=smart, ask the aux LLM before prompting the user.
+    # Cron smart mode uses the same gate, but fails closed instead of prompting
+    # because there is no user present to answer an escalation.
     # Inspired by OpenAI Codex's Smart Approvals guardian subagent
     # (openai/codex#13860).
-    if approval_mode == "smart":
+    if approval_mode == "smart" or cron_smart_mode:
         combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
         verdict = _smart_approve(command, combined_desc_for_llm)
         if verdict == "approve":
@@ -1168,6 +1205,13 @@ def check_all_command_guards(command: str, env_type: str,
                 "message": f"BLOCKED by smart approval: {combined_desc_for_llm}. "
                            "The command was assessed as genuinely dangerous. Do NOT retry.",
                 "smart_denied": True,
+            }
+        if cron_smart_mode:
+            return {
+                "approved": False,
+                "message": f"BLOCKED: Smart approval was uncertain about this cron command ({combined_desc_for_llm}). "
+                           "Cron jobs run without a user present, so uncertain approvals fail closed.",
+                "smart_escalated": True,
             }
         # verdict == "escalate" → fall through to manual prompt
 

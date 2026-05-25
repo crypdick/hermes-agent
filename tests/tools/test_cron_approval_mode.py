@@ -44,6 +44,11 @@ class TestCronApprovalModeParsing:
         with mock_patch("hermes_cli.config.load_config", return_value={"approvals": {"cron_mode": "approve"}}):
             assert _get_cron_approval_mode() == "approve"
 
+    def test_explicit_smart(self):
+        from unittest.mock import patch as mock_patch
+        with mock_patch("hermes_cli.config.load_config", return_value={"approvals": {"cron_mode": "smart"}}):
+            assert _get_cron_approval_mode() == "smart"
+
     def test_off_maps_to_approve(self):
         """'off' is an alias for 'approve' (matches --yolo semantics)."""
         from unittest.mock import patch as mock_patch
@@ -167,6 +172,67 @@ class TestCronApproveMode:
         with mock_patch("tools.approval._get_cron_approval_mode", return_value="approve"):
             result = check_dangerous_command("rm -rf /tmp/stuff", "local")
             assert result["approved"]
+
+
+class TestCronSmartMode:
+    """When cron_mode=smart, cron jobs use the same LLM gate as interactive smart approvals."""
+
+    def test_dangerous_command_auto_approved_when_smart_approves(self, monkeypatch):
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+
+        from unittest.mock import patch as mock_patch
+        with mock_patch("tools.approval._get_cron_approval_mode", return_value="smart"), \
+             mock_patch("tools.approval._smart_approve", return_value="approve") as smart:
+            result = check_dangerous_command("rm -rf /tmp/stuff", "local")
+            assert result["approved"]
+            assert result.get("smart_approved") is True
+            smart.assert_called_once()
+
+    def test_dangerous_command_blocked_when_smart_denies(self, monkeypatch):
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+
+        from unittest.mock import patch as mock_patch
+        with mock_patch("tools.approval._get_cron_approval_mode", return_value="smart"), \
+             mock_patch("tools.approval._smart_approve", return_value="deny"):
+            result = check_dangerous_command("rm -rf /tmp/stuff", "local")
+            assert not result["approved"]
+            assert result.get("smart_denied") is True
+            assert "smart approval" in result["message"]
+
+    def test_dangerous_command_blocked_when_smart_escalates(self, monkeypatch):
+        """Cron has no user present, so uncertain smart approvals must fail closed."""
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+
+        from unittest.mock import patch as mock_patch
+        with mock_patch("tools.approval._get_cron_approval_mode", return_value="smart"), \
+             mock_patch("tools.approval._smart_approve", return_value="escalate"):
+            result = check_dangerous_command("rm -rf /tmp/stuff", "local")
+            assert not result["approved"]
+            assert "uncertain" in result["message"].lower()
+
+    def test_combined_guard_uses_smart_mode(self, monkeypatch):
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+        monkeypatch.delenv("HERMES_YOLO_MODE", raising=False)
+
+        from unittest.mock import patch as mock_patch
+        with mock_patch("tools.approval._get_cron_approval_mode", return_value="smart"), \
+             mock_patch("tools.approval._smart_approve", return_value="approve") as smart:
+            result = check_all_command_guards("rm -rf /tmp/stuff", "local")
+            assert result["approved"]
+            assert result.get("smart_approved") is True
+            smart.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

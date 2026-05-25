@@ -30,15 +30,22 @@ The approval system supports three modes, configured via `approvals.mode` in `~/
 
 ```yaml
 approvals:
-  mode: manual    # manual | smart | off
-  timeout: 60     # seconds to wait for user response (default: 60)
+  mode: manual      # manual | smart | off
+  timeout: 60       # seconds to wait for user response (default: 60)
+  cron_mode: deny   # deny | smart | approve for cron jobs
 ```
 
-| Mode | Behavior |
-|------|----------|
-| **manual** (default) | Always prompt the user for approval on dangerous commands |
-| **smart** | Use an auxiliary LLM to assess risk. Low-risk commands (e.g., `python -c "print('hello')"`) are auto-approved. Genuinely dangerous commands are auto-denied. Uncertain cases escalate to a manual prompt. |
-| **off** | Disable all approval checks — equivalent to running with `--yolo`. All commands execute without prompts. |
+Mode behavior:
+
+- `manual` (default): always prompt the user for approval on dangerous commands.
+- `smart`: use an auxiliary LLM to assess risk. Low-risk commands (e.g. `python -c "print('hello')"`) are auto-approved. Genuinely dangerous commands are auto-denied. Uncertain cases escalate to a manual prompt.
+- `off`: disable approval prompts — equivalent to running with `--yolo`. Hardline blocks still apply.
+
+Cron behavior:
+
+- `deny` (default): block flagged dangerous commands because cron has no human present.
+- `smart`: use the same auxiliary LLM approval gate as interactive smart approvals. Safe commands are auto-approved, dangerous commands are auto-denied, and uncertain/failed smart approvals fail closed.
+- `approve`: auto-approve flagged dangerous commands in cron jobs.
 
 :::warning
 Setting `approvals.mode: off` disables all safety prompts. Use only in trusted environments (CI/CD, containers, etc.).
