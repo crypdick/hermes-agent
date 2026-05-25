@@ -521,8 +521,12 @@ class TestPromptGuidance:
         from agent.prompt_builder import COMPUTER_USE_GUIDANCE
         assert "background" in COMPUTER_USE_GUIDANCE.lower()
         assert "element" in COMPUTER_USE_GUIDANCE.lower()
-        # Security callouts must remain
+        # Security callouts must remain, but secret entry is permission-gated
+        # rather than absolutely forbidden.
         assert "password" in COMPUTER_USE_GUIDANCE.lower()
+        assert "explicit user authorization" in COMPUTER_USE_GUIDANCE.lower()
+        assert "do not type passwords" not in COMPUTER_USE_GUIDANCE.lower()
+        assert "secrets — ever" not in COMPUTER_USE_GUIDANCE.lower()
 
 
 # ---------------------------------------------------------------------------
