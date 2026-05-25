@@ -33,7 +33,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 
 # ---------------------------------------------------------------------------
 # WAL-compatibility fallback
@@ -221,6 +221,26 @@ CREATE TABLE IF NOT EXISTS sessions (
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
+CREATE TABLE IF NOT EXISTS conversation_contexts (
+    id TEXT PRIMARY KEY,
+    platform TEXT NOT NULL,
+    context_type TEXT NOT NULL,
+    external_chat_id TEXT,
+    external_thread_id TEXT,
+    external_user_id TEXT,
+    display_name TEXT,
+    routing_key TEXT NOT NULL,
+    metadata_json TEXT,
+    UNIQUE(platform, routing_key)
+);
+
+CREATE TABLE IF NOT EXISTS session_contexts (
+    session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    context_id TEXT NOT NULL REFERENCES conversation_contexts(id) ON DELETE CASCADE,
+    relationship TEXT NOT NULL DEFAULT 'origin',
+    PRIMARY KEY (session_id, context_id, relationship)
+);
+
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     session_id TEXT NOT NULL REFERENCES sessions(id),
@@ -247,6 +267,12 @@ CREATE TABLE IF NOT EXISTS state_meta (
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_context_platform_routing
+    ON conversation_contexts(platform, routing_key);
+CREATE INDEX IF NOT EXISTS idx_context_platform_chat_thread
+    ON conversation_contexts(platform, external_chat_id, external_thread_id);
+CREATE INDEX IF NOT EXISTS idx_session_contexts_context
+    ON session_contexts(context_id, session_id);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 """
 
@@ -354,6 +380,7 @@ class SessionDB:
             self._conn.execute("PRAGMA foreign_keys=ON")
 
             self._init_schema()
+            self.backfill_conversation_contexts_from_sessions_index()
         except Exception as exc:
             # Capture the cause so /resume and friends can surface WHY the
             # session DB is unavailable instead of a bare "Session database
@@ -690,6 +717,7 @@ class SessionDB:
         system_prompt: str = None,
         user_id: str = None,
         parent_session_id: str = None,
+        context: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Shared INSERT OR IGNORE for session rows."""
         def _do(conn):
@@ -708,12 +736,209 @@ class SessionDB:
                     time.time(),
                 ),
             )
+            if context:
+                self._upsert_session_context(conn, session_id, context)
         self._execute_write(_do)
+
+    def _normalize_context(self, context: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize a platform routing context for conversation_contexts."""
+        platform = str(context.get("platform") or context.get("source") or "").strip()
+        if not platform:
+            raise ValueError("conversation context requires platform")
+        routing_key = str(context.get("routing_key") or "").strip()
+        external_chat_id = context.get("external_chat_id") or context.get("chat_id")
+        external_thread_id = context.get("external_thread_id") or context.get("thread_id")
+        external_user_id = context.get("external_user_id") or context.get("user_id")
+        context_type = str(context.get("context_type") or context.get("chat_type") or "session")
+        if not routing_key:
+            parts = [platform, context_type]
+            for value in (external_chat_id, external_thread_id, external_user_id):
+                if value:
+                    parts.append(str(value))
+            routing_key = ":".join(parts)
+        context_id = context.get("id") or f"{platform}:{routing_key}"
+        return {
+            "id": context_id,
+            "platform": platform,
+            "context_type": context_type,
+            "external_chat_id": str(external_chat_id) if external_chat_id is not None else None,
+            "external_thread_id": str(external_thread_id) if external_thread_id is not None else None,
+            "external_user_id": str(external_user_id) if external_user_id is not None else None,
+            "display_name": context.get("display_name") or context.get("chat_name"),
+            "routing_key": routing_key,
+            "metadata": context.get("metadata") or {},
+            "relationship": context.get("relationship") or "origin",
+        }
+
+    def _upsert_session_context(
+        self,
+        conn: sqlite3.Connection,
+        session_id: str,
+        context: Dict[str, Any],
+    ) -> None:
+        normalized = self._normalize_context(context)
+        conn.execute(
+            """INSERT INTO conversation_contexts (
+                   id, platform, context_type, external_chat_id, external_thread_id,
+                   external_user_id, display_name, routing_key, metadata_json)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+               ON CONFLICT(platform, routing_key) DO UPDATE SET
+                   context_type=excluded.context_type,
+                   external_chat_id=excluded.external_chat_id,
+                   external_thread_id=excluded.external_thread_id,
+                   external_user_id=excluded.external_user_id,
+                   display_name=COALESCE(excluded.display_name, conversation_contexts.display_name),
+                   metadata_json=excluded.metadata_json""",
+            (
+                normalized["id"],
+                normalized["platform"],
+                normalized["context_type"],
+                normalized["external_chat_id"],
+                normalized["external_thread_id"],
+                normalized["external_user_id"],
+                normalized["display_name"],
+                normalized["routing_key"],
+                json.dumps(normalized["metadata"]) if normalized["metadata"] else None,
+            ),
+        )
+        row = conn.execute(
+            "SELECT id FROM conversation_contexts WHERE platform = ? AND routing_key = ?",
+            (normalized["platform"], normalized["routing_key"]),
+        ).fetchone()
+        context_id = row[0] if row else normalized["id"]
+        conn.execute(
+            """INSERT OR IGNORE INTO session_contexts (session_id, context_id, relationship)
+               VALUES (?, ?, ?)""",
+            (session_id, context_id, normalized["relationship"]),
+        )
 
     def create_session(self, session_id: str, source: str, **kwargs) -> str:
         """Create a new session record. Returns the session_id."""
         self._insert_session_row(session_id, source, **kwargs)
         return session_id
+
+    def get_session_contexts(self, session_id: str) -> List[Dict[str, Any]]:
+        """Return normalized platform contexts attached to a session."""
+        with self._lock:
+            cursor = self._conn.execute(
+                """SELECT cc.*, sc.relationship
+                   FROM session_contexts sc
+                   JOIN conversation_contexts cc ON cc.id = sc.context_id
+                   WHERE sc.session_id = ?
+                   ORDER BY CASE sc.relationship WHEN 'origin' THEN 0 ELSE 1 END,
+                            cc.platform, cc.routing_key""",
+                (session_id,),
+            )
+            rows = cursor.fetchall()
+        contexts = []
+        for row in rows:
+            item = dict(row)
+            metadata_json = item.pop("metadata_json", None)
+            if metadata_json:
+                try:
+                    item["metadata"] = json.loads(metadata_json)
+                except json.JSONDecodeError:
+                    item["metadata"] = {}
+            else:
+                item["metadata"] = {}
+            contexts.append(item)
+        return contexts
+
+    def _context_from_sessions_index_entry(
+        self,
+        session_key: str,
+        entry: Dict[str, Any],
+    ) -> Optional[Dict[str, Any]]:
+        """Build a normalized context from legacy gateway sessions.json metadata."""
+        session_id = entry.get("session_id")
+        if not session_id:
+            return None
+
+        origin_value = entry.get("origin")
+        origin: Dict[str, Any] = origin_value if isinstance(origin_value, dict) else {}
+        platform = origin.get("platform") or entry.get("platform") or entry.get("source")
+        if not platform:
+            return None
+
+        chat_type = origin.get("chat_type") or entry.get("chat_type") or "chat"
+        thread_id = origin.get("thread_id")
+        if chat_type == "dm":
+            context_type = "dm"
+        elif thread_id:
+            context_type = "topic" if platform == "telegram" else "thread"
+        else:
+            context_type = chat_type or "chat"
+
+        metadata = dict(origin)
+        metadata.setdefault("session_key", session_key)
+        return {
+            "platform": platform,
+            "context_type": context_type,
+            "external_chat_id": origin.get("chat_id") or entry.get("chat_id"),
+            "external_thread_id": thread_id,
+            "external_user_id": origin.get("user_id") or entry.get("user_id"),
+            "display_name": origin.get("chat_name") or entry.get("display_name"),
+            "routing_key": entry.get("session_key") or session_key,
+            "metadata": metadata,
+            "relationship": "origin",
+        }
+
+    def backfill_conversation_contexts_from_sessions_index(
+        self,
+        sessions_index_path: Optional[Path] = None,
+    ) -> int:
+        """Backfill normalized conversation contexts from gateway sessions.json.
+
+        The gateway has historically kept platform/chat/thread identity in
+        ``sessions/sessions.json`` even when ``state.db`` only had source/user
+        columns. This idempotently attaches that origin context to matching DB
+        sessions so scoped recall works for historical sessions.
+        """
+        path = sessions_index_path or (get_hermes_home() / "sessions" / "sessions.json")
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return 0
+        if not isinstance(raw, dict):
+            return 0
+
+        def _do(conn):
+            count = 0
+            for session_key, entry in raw.items():
+                if not isinstance(entry, dict):
+                    continue
+                session_id = entry.get("session_id")
+                if not session_id:
+                    continue
+                exists = conn.execute(
+                    "SELECT 1 FROM sessions WHERE id = ?",
+                    (session_id,),
+                ).fetchone()
+                if not exists:
+                    continue
+                already = conn.execute(
+                    """SELECT 1 FROM session_contexts
+                       WHERE session_id = ? AND relationship = 'origin'
+                       LIMIT 1""",
+                    (session_id,),
+                ).fetchone()
+                if already:
+                    continue
+                context = self._context_from_sessions_index_entry(str(session_key), entry)
+                if not context:
+                    continue
+                self._upsert_session_context(conn, session_id, context)
+                count += 1
+            if count:
+                conn.execute(
+                    "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    ("conversation_context_backfill_count", str(count)),
+                )
+            return count
+
+        return self._execute_write(_do)
+
     def end_session(self, session_id: str, end_reason: str) -> None:
         """Mark a session as ended.
 
@@ -1168,6 +1393,7 @@ class SessionDB:
         include_children: bool = False,
         project_compression_tips: bool = True,
         order_by_last_active: bool = False,
+        context_filter: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -1221,6 +1447,14 @@ class SessionDB:
             where_clauses.append(f"s.source NOT IN ({placeholders})")
             params.extend(exclude_sources)
 
+        context_join = """
+            LEFT JOIN session_contexts sc ON sc.session_id = s.id AND sc.relationship = 'origin'
+            LEFT JOIN conversation_contexts cc ON cc.id = sc.context_id
+        """
+        context_clauses, context_params = self._build_context_filter(context_filter)
+        where_clauses.extend(context_clauses)
+        params.extend(context_params)
+
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
         if order_by_last_active:
             # Compute effective_last_active by walking each surfaced session's
@@ -1236,7 +1470,7 @@ class SessionDB:
             # child.started_at >= parent.ended_at).
             query = f"""
                 WITH RECURSIVE chain(root_id, cur_id) AS (
-                    SELECT s.id, s.id FROM sessions s {where_sql}
+                    SELECT s.id, s.id FROM sessions s {context_join} {where_sql}
                     UNION ALL
                     SELECT c.root_id, child.id
                     FROM chain c
@@ -1269,6 +1503,7 @@ class SessionDB:
                     ) AS last_active,
                     COALESCE(cm.effective_last_active, s.started_at) AS _effective_last_active
                 FROM sessions s
+                {context_join}
                 LEFT JOIN chain_max cm ON cm.root_id = s.id
                 {where_sql}
                 ORDER BY _effective_last_active DESC, s.started_at DESC, s.id DESC
@@ -1291,6 +1526,7 @@ class SessionDB:
                         s.started_at
                     ) AS last_active
                 FROM sessions s
+                {context_join}
                 {where_sql}
                 ORDER BY s.started_at DESC
                 LIMIT ? OFFSET ?
@@ -1877,12 +2113,41 @@ class SessionDB:
         """Count CJK characters in text."""
         return sum(1 for ch in text if cls._is_cjk_codepoint(ord(ch)))
 
+    def _build_context_filter(
+        self,
+        context_filter: Optional[Dict[str, Any]] = None,
+        *,
+        alias: str = "cc",
+    ) -> tuple[list[str], list[Any]]:
+        """Build WHERE clauses for normalized conversation context filters."""
+        if not context_filter:
+            return [], []
+        field_map = {
+            "platform": "platform",
+            "context_type": "context_type",
+            "external_chat_id": "external_chat_id",
+            "chat_id": "external_chat_id",
+            "external_thread_id": "external_thread_id",
+            "thread_id": "external_thread_id",
+            "external_user_id": "external_user_id",
+            "user_id": "external_user_id",
+            "routing_key": "routing_key",
+        }
+        clauses: list[str] = []
+        params: list[Any] = []
+        for input_key, column in field_map.items():
+            if input_key in context_filter and context_filter[input_key] is not None:
+                clauses.append(f"{alias}.{column} = ?")
+                params.append(str(context_filter[input_key]))
+        return clauses, params
+
     def search_messages(
         self,
         query: str,
         source_filter: List[str] = None,
         exclude_sources: List[str] = None,
         role_filter: List[str] = None,
+        context_filter: Optional[Dict[str, Any]] = None,
         limit: int = 20,
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
@@ -1924,6 +2189,14 @@ class SessionDB:
             where_clauses.append(f"m.role IN ({role_placeholders})")
             params.extend(role_filter)
 
+        context_join = """
+            LEFT JOIN session_contexts sc ON sc.session_id = s.id AND sc.relationship = 'origin'
+            LEFT JOIN conversation_contexts cc ON cc.id = sc.context_id
+        """
+        context_clauses, context_params = self._build_context_filter(context_filter)
+        where_clauses.extend(context_clauses)
+        params.extend(context_params)
+
         where_sql = " AND ".join(where_clauses)
         params.extend([limit, offset])
 
@@ -1938,10 +2211,15 @@ class SessionDB:
                 m.tool_name,
                 s.source,
                 s.model,
-                s.started_at AS session_started
+                s.started_at AS session_started,
+                cc.routing_key AS context_routing_key,
+                cc.platform AS context_platform,
+                cc.external_chat_id AS context_chat_id,
+                cc.external_thread_id AS context_thread_id
             FROM messages_fts
             JOIN messages m ON m.id = messages_fts.rowid
             JOIN sessions s ON s.id = m.session_id
+            {context_join}
             WHERE {where_sql}
             ORDER BY rank
             LIMIT ? OFFSET ?
@@ -1996,6 +2274,9 @@ class SessionDB:
                 if role_filter:
                     tri_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     tri_params.extend(role_filter)
+                tri_context_clauses, tri_context_params = self._build_context_filter(context_filter)
+                tri_where.extend(tri_context_clauses)
+                tri_params.extend(tri_context_params)
                 tri_sql = f"""
                     SELECT
                         m.id,
@@ -2007,10 +2288,15 @@ class SessionDB:
                         m.tool_name,
                         s.source,
                         s.model,
-                        s.started_at AS session_started
+                        s.started_at AS session_started,
+                        cc.routing_key AS context_routing_key,
+                        cc.platform AS context_platform,
+                        cc.external_chat_id AS context_chat_id,
+                        cc.external_thread_id AS context_thread_id
                     FROM messages_fts_trigram
                     JOIN messages m ON m.id = messages_fts_trigram.rowid
                     JOIN sessions s ON s.id = m.session_id
+                    {context_join}
                     WHERE {' AND '.join(tri_where)}
                     ORDER BY rank
                     LIMIT ? OFFSET ?
@@ -2051,15 +2337,23 @@ class SessionDB:
                 if role_filter:
                     like_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                     like_params.extend(role_filter)
+                like_context_clauses, like_context_params = self._build_context_filter(context_filter)
+                like_where.extend(like_context_clauses)
+                like_params.extend(like_context_params)
                 like_sql = f"""
                     SELECT m.id, m.session_id, m.role,
                            substr(m.content,
                                   max(1, instr(m.content, ?) - 40),
                                   120) AS snippet,
                            m.content, m.timestamp, m.tool_name,
-                           s.source, s.model, s.started_at AS session_started
+                           s.source, s.model, s.started_at AS session_started,
+                           cc.routing_key AS context_routing_key,
+                           cc.platform AS context_platform,
+                           cc.external_chat_id AS context_chat_id,
+                           cc.external_thread_id AS context_thread_id
                     FROM messages m
                     JOIN sessions s ON s.id = m.session_id
+                    {context_join}
                     WHERE {' AND '.join(like_where)}
                     ORDER BY m.timestamp DESC
                     LIMIT ? OFFSET ?

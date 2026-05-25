@@ -38,6 +38,14 @@ class TestSessionSearchSchema:
         assert "past conversations" in description
         assert "recent turns of the current session" not in description
 
+    def test_exposes_context_scope_filters(self):
+        properties = SESSION_SEARCH_SCHEMA["parameters"]["properties"]
+        assert "scope" in properties
+        assert "platform" in properties
+        assert "chat_id" in properties
+        assert "thread_id" in properties
+        assert "routing_key" in properties
+
 
 # =========================================================================
 # _format_timestamp
@@ -257,6 +265,27 @@ class TestRecentSessionListing:
             order_by_last_active=True,
         )
 
+    def test_recent_mode_passes_context_filter_when_provided(self):
+        from unittest.mock import MagicMock
+
+        mock_db = MagicMock()
+        mock_db.list_sessions_rich.return_value = []
+        context_filter = {"platform": "telegram", "external_thread_id": "10"}
+
+        result = json.loads(_list_recent_sessions(
+            mock_db,
+            limit=5,
+            context_filter=context_filter,
+        ))
+
+        assert result["success"] is True
+        mock_db.list_sessions_rich.assert_called_once_with(
+            limit=10,
+            exclude_sources=["tool"],
+            order_by_last_active=True,
+            context_filter=context_filter,
+        )
+
     def test_current_child_session_excludes_root_lineage_even_when_child_id_is_longer(self):
         from unittest.mock import MagicMock
 
@@ -364,6 +393,118 @@ class TestSessionSearch:
         assert result["success"] is True
         assert result["count"] == 0
         assert result["results"] == []
+
+    def test_passes_explicit_context_filter_to_db_search(self):
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = []
+
+        result = json.loads(session_search(
+            query="migrations",
+            db=mock_db,
+            platform="telegram",
+            chat_id="-1001",
+            thread_id="10",
+            routing_key="telegram:group:-1001:topic:10",
+        ))
+
+        assert result["success"] is True
+        _, kwargs = mock_db.search_messages.call_args
+        assert kwargs["context_filter"] == {
+            "platform": "telegram",
+            "external_chat_id": "-1001",
+            "external_thread_id": "10",
+            "routing_key": "telegram:group:-1001:topic:10",
+        }
+
+    def test_current_context_scope_uses_gateway_session_context(self):
+        from unittest.mock import MagicMock
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools.session_search_tool import session_search
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = []
+        tokens = set_session_vars(
+            platform="telegram",
+            chat_id="-1001",
+            thread_id="10",
+            user_id="42",
+            session_key="telegram:group:-1001:topic:10",
+        )
+        try:
+            result = json.loads(session_search(
+                query="migrations",
+                db=mock_db,
+                scope="current_context",
+            ))
+        finally:
+            clear_session_vars(tokens)
+
+        assert result["success"] is True
+        _, kwargs = mock_db.search_messages.call_args
+        assert kwargs["context_filter"] == {
+            "platform": "telegram",
+            "external_chat_id": "-1001",
+            "external_thread_id": "10",
+            "routing_key": "telegram:group:-1001:topic:10",
+        }
+
+    def test_default_scope_uses_gateway_session_context(self):
+        from unittest.mock import MagicMock
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools.session_search_tool import session_search
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = []
+        tokens = set_session_vars(
+            platform="telegram",
+            chat_id="-1001",
+            thread_id="10",
+            user_id="42",
+            session_key="telegram:group:-1001:topic:10",
+        )
+        try:
+            result = json.loads(session_search(query="migrations", db=mock_db))
+        finally:
+            clear_session_vars(tokens)
+
+        assert result["success"] is True
+        _, kwargs = mock_db.search_messages.call_args
+        assert kwargs["context_filter"] == {
+            "platform": "telegram",
+            "external_chat_id": "-1001",
+            "external_thread_id": "10",
+            "routing_key": "telegram:group:-1001:topic:10",
+        }
+
+    def test_global_scope_disables_default_gateway_context_filter(self):
+        from unittest.mock import MagicMock
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools.session_search_tool import session_search
+
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = []
+        tokens = set_session_vars(
+            platform="telegram",
+            chat_id="-1001",
+            thread_id="10",
+            user_id="42",
+            session_key="telegram:group:-1001:topic:10",
+        )
+        try:
+            result = json.loads(session_search(
+                query="migrations",
+                db=mock_db,
+                scope="all",
+            ))
+        finally:
+            clear_session_vars(tokens)
+
+        assert result["success"] is True
+        _, kwargs = mock_db.search_messages.call_args
+        assert kwargs["context_filter"] is None
 
     def test_current_session_excluded_keeps_others(self):
         """Other sessions should still be returned when current is excluded."""

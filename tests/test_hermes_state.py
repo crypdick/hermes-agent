@@ -1,5 +1,6 @@
 """Tests for hermes_state.py — SessionDB SQLite CRUD, FTS5 search, export."""
 
+import json
 import time
 import pytest
 from pathlib import Path
@@ -135,6 +136,69 @@ class TestSessionLifecycle:
 
         child = db.get_session("child")
         assert child["parent_session_id"] == "parent"
+
+    def test_create_session_persists_normalized_origin_context(self, db):
+        db.create_session(
+            session_id="topic-session",
+            source="telegram",
+            context={
+                "platform": "telegram",
+                "context_type": "topic",
+                "external_chat_id": "-1003929846143",
+                "external_thread_id": "1452",
+                "external_user_id": "42",
+                "display_name": "Hermes / Topic",
+                "routing_key": "telegram:group:-1003929846143:topic:1452",
+                "metadata": {"chat_type": "group", "user_name": "Ricardo"},
+            },
+        )
+
+        contexts = db.get_session_contexts("topic-session")
+
+        assert len(contexts) == 1
+        assert contexts[0]["platform"] == "telegram"
+        assert contexts[0]["context_type"] == "topic"
+        assert contexts[0]["external_chat_id"] == "-1003929846143"
+        assert contexts[0]["external_thread_id"] == "1452"
+        assert contexts[0]["relationship"] == "origin"
+        assert contexts[0]["metadata"] == {"chat_type": "group", "user_name": "Ricardo"}
+
+    def test_backfills_normalized_contexts_from_gateway_sessions_index(self, db, tmp_path):
+        db.create_session(session_id="legacy-topic-session", source="telegram")
+        sessions_index = tmp_path / "sessions.json"
+        sessions_index.write_text(json.dumps({
+            "agent:main:telegram:group:-1003929846143:1452": {
+                "session_key": "agent:main:telegram:group:-1003929846143:1452",
+                "session_id": "legacy-topic-session",
+                "display_name": "Hermes",
+                "platform": "telegram",
+                "chat_type": "group",
+                "origin": {
+                    "platform": "telegram",
+                    "chat_id": "-1003929846143",
+                    "chat_name": "Hermes",
+                    "chat_type": "group",
+                    "user_id": "42",
+                    "user_name": "Ricardo",
+                    "thread_id": "1452",
+                    "chat_topic": "Session search",
+                },
+            }
+        }), encoding="utf-8")
+
+        count = db.backfill_conversation_contexts_from_sessions_index(sessions_index)
+        contexts = db.get_session_contexts("legacy-topic-session")
+
+        assert count == 1
+        assert len(contexts) == 1
+        assert contexts[0]["platform"] == "telegram"
+        assert contexts[0]["context_type"] == "topic"
+        assert contexts[0]["external_chat_id"] == "-1003929846143"
+        assert contexts[0]["external_thread_id"] == "1452"
+        assert contexts[0]["routing_key"] == "agent:main:telegram:group:-1003929846143:1452"
+        assert contexts[0]["metadata"]["chat_topic"] == "Session search"
+
+        assert db.backfill_conversation_contexts_from_sessions_index(sessions_index) == 0
 
 
 # =========================================================================
@@ -550,6 +614,45 @@ class TestFTS5Search:
         # Should only find the telegram message
         sources = [r["source"] for r in results]
         assert all(s == "telegram" for s in sources)
+
+    def test_search_with_conversation_context_filter_isolates_topic(self, db):
+        db.create_session(
+            session_id="topic-a",
+            source="telegram",
+            context={
+                "platform": "telegram",
+                "context_type": "topic",
+                "external_chat_id": "-1001",
+                "external_thread_id": "10",
+                "routing_key": "telegram:group:-1001:topic:10",
+            },
+        )
+        db.append_message("topic-a", role="user", content="Shared keyword about migrations")
+
+        db.create_session(
+            session_id="topic-b",
+            source="telegram",
+            context={
+                "platform": "telegram",
+                "context_type": "topic",
+                "external_chat_id": "-1001",
+                "external_thread_id": "11",
+                "routing_key": "telegram:group:-1001:topic:11",
+            },
+        )
+        db.append_message("topic-b", role="user", content="Shared keyword about migrations")
+
+        results = db.search_messages(
+            "Shared keyword",
+            context_filter={
+                "platform": "telegram",
+                "external_chat_id": "-1001",
+                "external_thread_id": "10",
+            },
+        )
+
+        assert {r["session_id"] for r in results} == {"topic-a"}
+        assert all(r["context_routing_key"] == "telegram:group:-1001:topic:10" for r in results)
 
     def test_search_default_sources_include_acp(self, db):
         db.create_session(session_id="s1", source="acp")
@@ -1447,7 +1550,7 @@ class TestSchemaInit:
     def test_schema_version(self, db):
         cursor = db._conn.execute("SELECT version FROM schema_version")
         version = cursor.fetchone()[0]
-        assert version == 11
+        assert version == 12
 
     def test_title_column_exists(self, db):
         """Verify the title column was created in the sessions table."""
@@ -1739,12 +1842,12 @@ class TestSchemaInit:
         conn.commit()
         conn.close()
 
-        # Open with SessionDB — should migrate to v9
+        # Open with SessionDB — should migrate to the current schema
         migrated_db = SessionDB(db_path=db_path)
 
         # Verify migration
         cursor = migrated_db._conn.execute("SELECT version FROM schema_version")
-        assert cursor.fetchone()[0] == 11
+        assert cursor.fetchone()[0] == 12
 
         # Verify title column exists and is NULL for existing sessions
         session = migrated_db.get_session("existing")
@@ -2939,7 +3042,7 @@ class TestFTS5ToolCallMigration:
                 "SELECT version FROM schema_version LIMIT 1"
             ).fetchone()
             version = row["version"] if hasattr(row, "keys") else row[0]
-            assert version == 11
+            assert version == 12
         finally:
             session_db.close()
 

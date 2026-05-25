@@ -665,6 +665,32 @@ def build_session_key(
     return ":".join(key_parts)
 
 
+def conversation_context_from_source(
+    source: SessionSource,
+    session_key: str,
+) -> Dict[str, Any]:
+    """Build normalized persistent conversation context metadata for state.db."""
+    if source.chat_type == "dm":
+        context_type = "dm"
+    elif source.thread_id:
+        context_type = "topic" if source.platform == Platform.TELEGRAM else "thread"
+    else:
+        context_type = source.chat_type or "chat"
+
+    metadata = source.to_dict()
+    return {
+        "platform": source.platform.value,
+        "context_type": context_type,
+        "external_chat_id": source.chat_id,
+        "external_thread_id": source.thread_id,
+        "external_user_id": source.user_id or source.user_id_alt,
+        "display_name": source.chat_name,
+        "routing_key": session_key,
+        "metadata": metadata,
+        "relationship": "origin",
+    }
+
+
 class SessionStore:
     """
     Manages session storage and retrieval.
@@ -870,7 +896,7 @@ class SessionStore:
         # SQLite calls are made outside the lock to avoid holding it during I/O.
         # All _entries / _loaded mutations are protected by self._lock.
         db_end_session_id = None
-        db_create_kwargs = None
+        db_create_kwargs: Optional[Dict[str, Any]] = None
 
         with self._lock:
             self._ensure_loaded_locked()
@@ -937,6 +963,7 @@ class SessionStore:
                 "session_id": session_id,
                 "source": source.platform.value,
                 "user_id": source.user_id,
+                "context": conversation_context_from_source(source, session_key),
             }
 
         # SQLite operations outside the lock
@@ -1130,7 +1157,7 @@ class SessionStore:
     def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
         """Force reset a session, creating a new session ID."""
         db_end_session_id = None
-        db_create_kwargs = None
+        db_create_kwargs: Optional[Dict[str, Any]] = None
         new_entry = None
 
         with self._lock:
@@ -1163,6 +1190,10 @@ class SessionStore:
                 "session_id": session_id,
                 "source": old_entry.platform.value if old_entry.platform else "unknown",
                 "user_id": old_entry.origin.user_id if old_entry.origin else None,
+                "context": (
+                    conversation_context_from_source(old_entry.origin, session_key)
+                    if old_entry.origin else None
+                ),
             }
 
         if self._db and db_end_session_id:

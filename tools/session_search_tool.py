@@ -22,7 +22,7 @@ import concurrent.futures
 import json
 import logging
 import re
-from typing import Dict, Any, List, Optional, Union
+from typing import Dict, Any, List, Optional, Union, Callable
 
 from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
 MAX_SESSION_CHARS = 100_000
@@ -265,14 +265,22 @@ async def _summarize_session(
 _HIDDEN_SESSION_SOURCES = ("tool",)
 
 
-def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str:
+def _list_recent_sessions(
+    db,
+    limit: int,
+    current_session_id: Optional[str] = None,
+    context_filter: Optional[Dict[str, Any]] = None,
+) -> str:
     """Return metadata for the most recent sessions (no LLM calls)."""
     try:
-        sessions = db.list_sessions_rich(
-            limit=limit + 5,
-            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
-            order_by_last_active=True,
-        )  # fetch extra to skip current
+        list_kwargs: Dict[str, Any] = {
+            "limit": limit + 5,
+            "exclude_sources": list(_HIDDEN_SESSION_SOURCES),
+            "order_by_last_active": True,
+        }
+        if context_filter:
+            list_kwargs["context_filter"] = context_filter
+        sessions = db.list_sessions_rich(**list_kwargs)  # fetch extra to skip current
 
         # Resolve current session lineage to exclude it
         current_root = None
@@ -322,12 +330,61 @@ def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str
         return tool_error(f"Failed to list recent sessions: {e}", success=False)
 
 
+def _build_context_filter(
+    *,
+    platform: Optional[str] = None,
+    chat_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    routing_key: Optional[str] = None,
+    scope: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Build a normalized DB context filter from tool arguments/session context.
+
+    Default behavior is topic/chat-local recall when a gateway session context is
+    available. Pass scope="all" for global recall across every session.
+    """
+    effective_scope = scope or "current_context"
+    if effective_scope == "all":
+        effective_scope = None
+    if effective_scope in {"current_context", "current_thread"}:
+        try:
+            get_session_env: Callable[[str, str], str]
+            from gateway.session_context import get_session_env as _get_session_env
+            get_session_env = _get_session_env
+        except Exception:
+            import os
+            get_session_env = lambda name, default="": os.getenv(name, default) or default
+        platform = platform or get_session_env("HERMES_SESSION_PLATFORM", "")
+        chat_id = chat_id or get_session_env("HERMES_SESSION_CHAT_ID", "")
+        thread_id = thread_id or get_session_env("HERMES_SESSION_THREAD_ID", "")
+        routing_key = routing_key or get_session_env("HERMES_SESSION_KEY", "")
+    context_filter = {}
+    if platform:
+        context_filter["platform"] = platform
+    if chat_id:
+        context_filter["external_chat_id"] = chat_id
+    if thread_id:
+        context_filter["external_thread_id"] = thread_id
+    if user_id:
+        context_filter["external_user_id"] = user_id
+    if routing_key:
+        context_filter["routing_key"] = routing_key
+    return context_filter or None
+
+
 def session_search(
     query: str,
-    role_filter: str = None,
+    role_filter: Optional[str] = None,
     limit: int = 3,
     db=None,
-    current_session_id: str = None,
+    current_session_id: Optional[str] = None,
+    scope: Optional[str] = None,
+    platform: Optional[str] = None,
+    chat_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
+    user_id: Optional[str] = None,
+    routing_key: Optional[str] = None,
 ) -> str:
     """
     Search past sessions and return focused summaries of matching conversations.
@@ -356,10 +413,19 @@ def session_search(
             limit = 3
     limit = max(1, min(limit, 5))  # Clamp to [1, 5]
 
+    context_filter = _build_context_filter(
+        scope=scope,
+        platform=platform,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        user_id=user_id,
+        routing_key=routing_key,
+    )
+
     # Recent sessions mode: when query is empty, return metadata for recent sessions.
     # No LLM calls — just DB queries for titles, previews, timestamps.
     if not query or not query.strip():
-        return _list_recent_sessions(db, limit, current_session_id)
+        return _list_recent_sessions(db, limit, current_session_id, context_filter)
 
     query = query.strip()
 
@@ -374,6 +440,7 @@ def session_search(
             query=query,
             role_filter=role_list,
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+            context_filter=context_filter,
             limit=50,  # Get more matches to find unique sessions
             offset=0,
         )
@@ -556,7 +623,8 @@ SESSION_SEARCH_SCHEMA = {
         "1. Recent sessions (no query): Call with no arguments to see what was worked on recently. "
         "Returns titles, previews, and timestamps. Zero LLM cost, instant. "
         "Start here when the user asks what were we working on or what did we do recently.\n"
-        "2. Keyword search (with query): Search for specific topics across all past sessions. "
+        "2. Keyword search (with query): Search for specific topics. In gateway chats, recall defaults to the current platform chat/thread/topic. "
+        "Pass scope='all' only when you explicitly need global search across every session. "
         "Returns LLM-generated summaries of matching sessions.\n\n"
         "USE THIS PROACTIVELY when:\n"
         "- The user says 'we did this before', 'remember when', 'last time', 'as I mentioned'\n"
@@ -588,6 +656,31 @@ SESSION_SEARCH_SCHEMA = {
                 "description": "Max sessions to summarize (default: 3, max: 5).",
                 "default": 3,
             },
+            "scope": {
+                "type": "string",
+                "enum": ["all", "current_context", "current_thread"],
+                "description": "Optional scope. Defaults to current_context/current_thread when gateway context is available so Telegram topics/threads search locally first. Use all for explicit global recall across every session.",
+            },
+            "platform": {
+                "type": "string",
+                "description": "Optional platform filter for scoped recall, e.g. telegram, discord, slack.",
+            },
+            "chat_id": {
+                "type": "string",
+                "description": "Optional platform chat/channel/group ID filter.",
+            },
+            "thread_id": {
+                "type": "string",
+                "description": "Optional platform thread/topic ID filter.",
+            },
+            "user_id": {
+                "type": "string",
+                "description": "Optional platform user ID filter.",
+            },
+            "routing_key": {
+                "type": "string",
+                "description": "Optional canonical conversation routing key filter.",
+            },
         },
         "required": [],
     },
@@ -606,7 +699,13 @@ registry.register(
         role_filter=args.get("role_filter"),
         limit=args.get("limit", 3),
         db=kw.get("db"),
-        current_session_id=kw.get("current_session_id")),
+        current_session_id=kw.get("current_session_id"),
+        scope=args.get("scope"),
+        platform=args.get("platform"),
+        chat_id=args.get("chat_id"),
+        thread_id=args.get("thread_id"),
+        user_id=args.get("user_id"),
+        routing_key=args.get("routing_key")),
     check_fn=check_session_search_requirements,
     emoji="🔍",
 )
