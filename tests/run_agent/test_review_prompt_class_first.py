@@ -1,11 +1,11 @@
 """Behavior tests for the skill review / combined review prompts.
 
-The review prompts steer the background review agent toward actively updating
-the skill library after most sessions, with a strong bias toward:
+The review prompts steer the background review agent toward updating
+the skill library only when there is a clear procedural lesson, with a strong bias toward:
   1. Patching currently-loaded skills first,
   2. Patching existing umbrellas next,
   3. Adding references/ files under an existing umbrella,
-  4. Creating a new class-level umbrella only when nothing else fits.
+  4. Creating a new class-level umbrella only when there is no existing skill for a durable way-of-working pattern.
 
 User-preference corrections (style, format, verbosity, legibility) are
 first-class skill signals, not just memory signals.
@@ -21,15 +21,15 @@ from run_agent import AIAgent
 # _SKILL_REVIEW_PROMPT
 # ---------------------------------------------------------------------------
 
-def test_skill_review_prompt_biases_toward_active_updates():
-    """Prompt must frame updating as the default stance, not something rare."""
+def test_skill_review_prompt_does_not_treat_qna_as_skill_signal():
+    """Prompt must not turn ordinary information-seeking chat into skills."""
     prompt = AIAgent._SKILL_REVIEW_PROMPT
-    assert "ACTIVE" in prompt or "active" in prompt.lower(), (
-        "must tell the reviewer to be active"
-    )
-    # "missed learning opportunity" or equivalent framing for not acting
-    assert "missed" in prompt.lower() or "opportunity" in prompt.lower(), (
-        "must frame inaction as a miss, not a neutral outcome"
+    lower = prompt.lower()
+    assert "information-seeking" in lower
+    assert "random topics" in lower
+    assert "without hermes turning those topics into skills" in lower
+    assert "knowledge vault" in lower, (
+        "informational findings worth preserving should be routed to the vault, not skills"
     )
 
 
@@ -91,12 +91,15 @@ def test_skill_review_prompt_names_three_support_file_kinds():
 
 
 def test_skill_review_prompt_has_name_veto_for_create():
-    """Creating a new skill must be gated behind class-level naming."""
+    """Creating a new skill must be gated behind class-level naming and procedural value."""
     prompt = AIAgent._SKILL_REVIEW_PROMPT
-    assert "class level" in prompt.lower() or "CLASS-LEVEL" in prompt
+    lower = prompt.lower()
+    assert "class level" in lower or "CLASS-LEVEL" in prompt
     assert "MUST NOT" in prompt or "must not" in prompt, (
         "must have a name-veto clause blocking session-artifact names"
     )
+    assert "merely because the user asked for information" in lower
+    assert "durable way-of-working pattern" in lower
 
 
 def test_skill_review_prompt_embeds_user_preferences_in_skills():
@@ -133,12 +136,14 @@ def test_combined_review_prompt_has_memory_section():
     assert "memory tool" in prompt
 
 
-def test_combined_review_prompt_skills_biased_toward_active_updates():
-    """Skills half must carry the active-update bias."""
+def test_combined_review_prompt_does_not_treat_qna_as_skill_signal():
+    """Skills half must carry the Q&A/casual-chat carve-out."""
     prompt = AIAgent._COMBINED_REVIEW_PROMPT
-    assert "**Skills**" in prompt
-    assert "ACTIVE" in prompt or "active" in prompt.lower()
-    assert "missed" in prompt.lower() or "opportunity" in prompt.lower()
+    lower = prompt.lower()
+    assert "**skills**" in lower
+    assert "information-seeking" in lower
+    assert "random topics" in lower
+    assert "knowledge vault" in lower
 
 
 def test_combined_review_prompt_treats_user_corrections_as_skill_signal():
