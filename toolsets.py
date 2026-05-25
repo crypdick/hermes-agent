@@ -60,6 +60,8 @@ _HERMES_CORE_TOOLS = [
     "send_message",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+    # Google Health API read-only data access (data tools gated on OAuth token)
+    "google_health_status", "google_health_list_data_points", "google_health_latest_data_points",
     # Kanban multi-agent coordination — only in schema when the agent is
     # spawned as a kanban worker (HERMES_KANBAN_TASK env set) or the current
     # profile explicitly enables the kanban toolset. Gated via check_fn in
@@ -239,6 +241,16 @@ TOOLSETS = {
         "includes": []
     },
 
+    "google_health": {
+        "description": "Read-only Google Health API metrics via Google OAuth",
+        "tools": [
+            "google_health_status",
+            "google_health_list_data_points",
+            "google_health_latest_data_points",
+        ],
+        "includes": [],
+    },
+
     "kanban": {
         "description": (
             "Kanban multi-agent coordination — only active when the agent "
@@ -375,6 +387,8 @@ TOOLSETS = {
             "cronjob",
             # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
             "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
+            # Google Health API read-only data access (data tools gated on OAuth token)
+            "google_health_status", "google_health_list_data_points", "google_health_latest_data_points",
 
         ],
         "includes": []
