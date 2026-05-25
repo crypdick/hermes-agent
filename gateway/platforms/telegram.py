@@ -4009,6 +4009,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         event = self._build_message_event(update.message, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
+        await self._inline_reply_to_audio_transcript(event, update.message.reply_to_message)
         self._enqueue_text_event(event)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4019,6 +4020,7 @@ class TelegramAdapter(BasePlatformAdapter):
             return
         
         event = self._build_message_event(update.message, MessageType.COMMAND, update_id=update.update_id)
+        await self._inline_reply_to_audio_transcript(event, update.message.reply_to_message)
         await self.handle_message(event)
 
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4221,6 +4223,7 @@ class TelegramAdapter(BasePlatformAdapter):
             msg_type = MessageType.DOCUMENT
         
         event = self._build_message_event(msg, msg_type, update_id=update.update_id)
+        await self._inline_reply_to_audio_transcript(event, msg.reply_to_message)
         
         # Add caption as text
         if msg.caption:
@@ -4627,6 +4630,86 @@ class TelegramAdapter(BasePlatformAdapter):
                 self.name, cache_key, thread_id,
             )
 
+    async def _inline_reply_to_audio_transcript(
+        self,
+        event: MessageEvent,
+        replied: Any,
+    ) -> None:
+        """Replace media-only voice/audio reply metadata with an inline STT transcript when possible."""
+        if not replied or not getattr(event, "reply_to_text", None):
+            return
+        if getattr(replied, "text", None) or getattr(replied, "caption", None):
+            return
+
+        media = getattr(replied, "voice", None)
+        label = "voice message"
+        ext = ".ogg"
+        if media is None:
+            media = getattr(replied, "audio", None)
+            label = "audio message"
+            ext = ".mp3"
+        if media is None or not hasattr(media, "get_file"):
+            return
+
+        try:
+            file_obj = await media.get_file()
+            audio_bytes = await file_obj.download_as_bytearray()
+            file_path = getattr(file_obj, "file_path", "") or ""
+            if label == "audio message":
+                lower_path = file_path.lower()
+                for candidate in (".ogg", ".oga", ".opus", ".wav", ".m4a", ".mp3"):
+                    if lower_path.endswith(candidate):
+                        ext = candidate
+                        break
+            cached_path = cache_audio_from_bytes(bytes(audio_bytes), ext=ext)
+            logger.info("[Telegram] Cached replied-to %s at %s", label, cached_path)
+
+            from tools.transcription_tools import transcribe_audio
+
+            result = await asyncio.to_thread(transcribe_audio, cached_path)
+            transcript = str(result.get("transcript") or "").strip() if result.get("success") else ""
+            if not transcript:
+                if result.get("error"):
+                    logger.debug(
+                        "[Telegram] Replied-to %s transcription failed: %s",
+                        label,
+                        result.get("error"),
+                    )
+                return
+            event.reply_to_text = f'[Replied-to Telegram {label} transcript: "{transcript}"]'
+        except Exception as exc:
+            logger.debug("[Telegram] Failed to inline replied-to audio transcript: %s", exc, exc_info=True)
+            return
+
+    def _reply_to_media_context(self, message: Any) -> Optional[str]:
+        """Return a concise context string for media-only replied-to messages.
+
+        Telegram's ``reply_to_message`` object often has no text/caption for
+        voice notes and other media. Without this fallback, a reply like
+        "Bump" reaches the agent with a reply pointer but no parent context.
+        """
+        media_specs = (
+            ("voice message", getattr(message, "voice", None), ("file_id", "file_unique_id", "duration", "file_size")),
+            ("audio message", getattr(message, "audio", None), ("file_id", "file_unique_id", "duration", "file_name", "title", "performer", "mime_type", "file_size")),
+            ("video message", getattr(message, "video", None), ("file_id", "file_unique_id", "duration", "file_name", "mime_type", "file_size")),
+            ("document", getattr(message, "document", None), ("file_id", "file_unique_id", "file_name", "mime_type", "file_size")),
+            ("photo", (getattr(message, "photo", None) or [None])[-1], ("file_id", "file_unique_id", "file_size", "width", "height")),
+            ("sticker", getattr(message, "sticker", None), ("file_id", "file_unique_id", "emoji", "set_name", "file_size")),
+        )
+        for label, media, fields in media_specs:
+            if not media:
+                continue
+            parts = []
+            for field in fields:
+                value = getattr(media, field, None)
+                if value is not None and value != "":
+                    parts.append(f"{field}={value}")
+            suffix = f"; {', '.join(parts)}" if parts else ""
+            message_id = getattr(message, "message_id", None)
+            id_part = f"message_id={message_id}; " if message_id is not None else ""
+            return f"[Replied-to Telegram {label}: {id_part}no text/caption available{suffix}]"
+        return None
+
     def _build_message_event(
         self,
         message: Message,
@@ -4718,20 +4801,24 @@ class TelegramAdapter(BasePlatformAdapter):
         # injected into the agent's context — which can cause the agent
         # to act on unrelated actionable-looking text the user didn't
         # quote (#22619). Fall back to the full replied-to message text
-        # / caption when no native quote is present.
+        # / caption when no native quote is present. If the replied-to
+        # message is media-only (notably voice/audio), preserve enough
+        # Telegram metadata for the agent/user to identify or recover it
+        # instead of silently reducing the turn to only the terse follow-up.
         reply_to_id = None
         reply_to_text = None
         if message.reply_to_message:
-            reply_to_id = str(message.reply_to_message.message_id)
+            replied = message.reply_to_message
+            reply_to_id = str(replied.message_id)
             quote = getattr(message, "quote", None)
             quote_text = getattr(quote, "text", None) if quote is not None else None
             if quote_text:
                 reply_to_text = quote_text
             else:
                 reply_to_text = (
-                    message.reply_to_message.text
-                    or message.reply_to_message.caption
-                    or None
+                    getattr(replied, "text", None)
+                    or getattr(replied, "caption", None)
+                    or self._reply_to_media_context(replied)
                 )
 
         # Per-channel/topic ephemeral prompt
