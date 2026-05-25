@@ -1250,6 +1250,11 @@ class GatewayRunner:
         # /new and /reset.  /model and other mid-session operations
         # preserve the queue.
         self._queued_events: Dict[str, List[MessageEvent]] = {}
+        # Sessions currently executing manual /compress. Platform adapters
+        # still consider the slash-command task active, but follow-up user
+        # messages should wait for compression to finish instead of setting the
+        # adapter interrupt event and aborting the compressor.
+        self._manual_compression_sessions: set[str] = set()
         self._pending_native_image_paths_by_session: Dict[str, List[str]] = {}
         self._busy_ack_ts: Dict[str, float] = {}  # last busy-ack timestamp per session (debounce)
         self._session_run_generation: Dict[str, int] = {}
@@ -2651,6 +2656,45 @@ class GatewayRunner:
             return False  # let default path handle it
 
         running_agent = self._running_agents.get(session_key)
+
+        if session_key in getattr(self, "_manual_compression_sessions", set()):
+            # Manual /compress runs as a gateway slash-command task, not as a
+            # normal AIAgent turn in _running_agents. The adapter's generic
+            # active-session path would otherwise treat follow-up text as an
+            # interrupt and set _active_sessions[session_key], which cancels the
+            # compression before the queued message can run. Preserve every
+            # follow-up as a separate FIFO turn, matching explicit /queue
+            # semantics, and do not signal the interrupt event.
+            self._enqueue_fifo(session_key, event, adapter)
+            if os.environ.get("HERMES_GATEWAY_BUSY_ACK_ENABLED", "true").lower() != "true":
+                return True
+            now = time.time()
+            last_ack = self._busy_ack_ts.get(session_key, 0)
+            if now - last_ack >= 30:
+                self._busy_ack_ts[session_key] = now
+                reply_anchor = self._reply_anchor_for_event(event)
+                thread_meta = self._thread_metadata_for_source(event.source, reply_anchor)
+                depth = self._queue_depth(session_key, adapter=adapter)
+                detail = "" if depth <= 1 else f" ({depth} queued)"
+                try:
+                    await adapter._send_with_retry(
+                        chat_id=event.source.chat_id,
+                        content=(
+                            f"⏳ Queued after compression{detail}. "
+                            f"I'll respond once /compress finishes."
+                        ),
+                        reply_to=(
+                            reply_anchor
+                            if event.source.platform == Platform.TELEGRAM
+                            and event.source.chat_type == "dm"
+                            and event.source.thread_id
+                            else (None if event.source.platform == Platform.TELEGRAM and event.source.thread_id else event.message_id)
+                        ),
+                        metadata=thread_meta,
+                    )
+                except Exception as e:
+                    logger.debug("Failed to send compression queue ack: %s", e)
+            return True
 
         btw_queue_payload = self._extract_btw_queue_payload(event.text)
         if btw_queue_payload is not None:
@@ -11279,13 +11323,18 @@ class GatewayRunner:
 
         # Extract optional focus topic from command args
         focus_topic = (event.get_command_args() or "").strip() or None
+        session_key = self._session_key_for_source(source)
+        compression_sessions = getattr(self, "_manual_compression_sessions", None)
+        if compression_sessions is None:
+            compression_sessions = set()
+            self._manual_compression_sessions = compression_sessions
+        compression_sessions.add(session_key)
 
         try:
             from run_agent import AIAgent
             from agent.manual_compression_feedback import summarize_manual_compression
             from agent.model_metadata import estimate_request_tokens_rough
 
-            session_key = self._session_key_for_source(source)
             model, runtime_kwargs = self._resolve_session_agent_runtime(
                 source=source,
                 session_key=session_key,
@@ -11396,6 +11445,8 @@ class GatewayRunner:
         except Exception as e:
             logger.warning("Manual compress failed: %s", e)
             return t("gateway.compress.failed", error=e)
+        finally:
+            compression_sessions.discard(session_key)
 
     async def _get_telegram_topic_capabilities(self, source: SessionSource) -> dict:
         """Read Telegram private-topic capability flags via Bot API getMe."""

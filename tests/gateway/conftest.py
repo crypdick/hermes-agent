@@ -39,6 +39,27 @@ from unittest.mock import MagicMock
 import pytest
 
 
+def _raise_nofile_limit_for_gateway_suite(min_soft: int = 4096) -> None:
+    """Give the large gateway suite enough fd headroom for aiohttp sockets.
+
+    macOS interactive shells often default to ``ulimit -n 256``. The gateway
+    suite creates many short-lived aiohttp test servers/clients; under that low
+    ceiling the run fails mid-suite with ``OSError: [Errno 24] Too many open
+    files`` and cascades into hundreds of unrelated errors. Raising the soft
+    limit is best-effort and local to the pytest process.
+    """
+    try:
+        import resource
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = min(max(soft, min_soft), hard)
+        if target > soft:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    except Exception:
+        # Never fail collection because the host disallows raising limits.
+        pass
+
+
 def _ensure_telegram_mock() -> None:
     """Install a comprehensive telegram mock in sys.modules.
 
@@ -321,6 +342,8 @@ def pytest_configure(config):
     anti-pattern, we fail the whole session with a clear message —
     before a polluted ``sys.path`` can cascade across workers.
     """
+    _raise_nofile_limit_for_gateway_suite()
+
     # Only run on the xdist controller (or in non-xdist runs). Skip on
     # worker subprocesses so we don't scan the filesystem N times.
     if hasattr(config, "workerinput"):

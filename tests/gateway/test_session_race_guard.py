@@ -30,6 +30,9 @@ class _FakeAdapter:
     async def send(self, chat_id, text, **kwargs):
         pass
 
+    async def _send_with_retry(self, chat_id, content, **kwargs):
+        return MagicMock(success=True, message_id="ack-1")
+
     async def interrupt_session_activity(self, session_key, chat_id):
         self.interrupted_sessions.append((session_key, chat_id))
         event = self._active_sessions.get(session_key)
@@ -46,7 +49,11 @@ def _make_runner():
     runner._running_agents = {}
     runner._running_agents_ts = {}
     runner._session_run_generation = {}
+    runner._manual_compression_sessions = set()
     runner._pending_messages = {}
+    runner._queued_events = {}
+    runner._busy_ack_ts = {}
+    runner._busy_input_mode = "interrupt"
     runner._pending_approvals = {}
     runner._voice_mode = {}
     runner._background_tasks = set()
@@ -298,6 +305,48 @@ async def test_recent_telegram_followups_append_in_pending_queue():
     fake_agent.interrupt.assert_not_called()
     adapter = runner.adapters[Platform.TELEGRAM]
     assert adapter._pending_messages[session_key].text == "part one\npart two"
+
+
+@pytest.mark.asyncio
+async def test_manual_compression_busy_followup_queues_without_interrupt():
+    """While /compress is running, normal follow-up text waits for compression to finish."""
+    runner = _make_runner()
+    event = _make_event(text="use this after compress")
+    session_key = build_session_key(event.source)
+    adapter = runner.adapters[Platform.TELEGRAM]
+    adapter._active_sessions[session_key] = asyncio.Event()
+    runner._manual_compression_sessions.add(session_key)
+
+    handled = await runner._handle_active_session_busy_message(event, session_key)
+
+    assert handled is True
+    assert adapter._pending_messages[session_key] is event
+    assert not adapter._active_sessions[session_key].is_set()
+    assert adapter.interrupted_sessions == []
+
+
+@pytest.mark.asyncio
+async def test_manual_compression_busy_followups_fifo_instead_of_merged():
+    """Multiple messages during /compress become separate next-turn queue items."""
+    runner = _make_runner()
+    first = _make_event(text="first queued")
+    second = _make_event(text="second queued")
+    third = _make_event(text="third queued")
+    session_key = build_session_key(first.source)
+    adapter = runner.adapters[Platform.TELEGRAM]
+    adapter._active_sessions[session_key] = asyncio.Event()
+    runner._manual_compression_sessions.add(session_key)
+
+    await runner._handle_active_session_busy_message(first, session_key)
+    await runner._handle_active_session_busy_message(second, session_key)
+    await runner._handle_active_session_busy_message(third, session_key)
+
+    assert adapter._pending_messages[session_key] is first
+    assert [event.text for event in runner._queued_events[session_key]] == [
+        "second queued",
+        "third queued",
+    ]
+    assert not adapter._active_sessions[session_key].is_set()
 
 
 # ------------------------------------------------------------------

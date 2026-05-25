@@ -117,7 +117,11 @@ class TestApiServerAdapterToolset:
             mock_model.return_value = "test/model"
             # User overrides with just web and terminal
             mock_config.return_value = {
-                "platform_toolsets": {"api_server": ["web", "terminal"]}
+                "platform_toolsets": {"api_server": ["web", "terminal"]},
+                # Plugins discovered after the user's saved config default on
+                # until hermes tools records them as known. Keep this test
+                # focused on the explicit built-in override contract.
+                "known_plugin_toolsets": {"api_server": ["google_health"]},
             }
             mock_agent_cls.return_value = MagicMock()
 
