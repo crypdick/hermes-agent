@@ -93,6 +93,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
     result = {"response": None, "error": None}
     request_client_holder = {"client": None}
     request_id = uuid.uuid4().hex[:8]
+    provider_activity = {"last": None, "count": 0}
+
+    def _mark_provider_activity() -> None:
+        provider_activity["last"] = time.time()
+        provider_activity["count"] += 1
+
     late_worker_state = {
         "stale_killed": False,
         "kill_elapsed": None,
@@ -111,6 +117,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     api_kwargs,
                     client=request_client_holder["client"],
                     on_first_delta=getattr(agent, "_codex_on_first_delta", None),
+                    on_stream_event=_mark_provider_activity,
                 )
             elif agent.api_mode == "anthropic_messages":
                 result["response"] = agent._anthropic_messages_create(api_kwargs)
@@ -180,9 +187,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # httpx timeout (default 1800s) with zero feedback.  The stale
     # detector kills the connection early so the main retry loop can
     # apply richer recovery (credential rotation, provider fallback).
-    _stale_timeout = agent._compute_non_stream_stale_timeout(
-        api_kwargs.get("messages", [])
-    )
+    _stale_timeout = agent._compute_non_stream_stale_timeout(api_kwargs)
 
     _call_start = time.time()
     agent._touch_activity("waiting for non-streaming API response")
@@ -204,21 +209,30 @@ def interruptible_api_call(agent, api_kwargs: dict):
 
         # Stale-call detector: kill the connection if no response
         # arrives within the configured timeout.
-        _elapsed = time.time() - _call_start
-        if _elapsed > _stale_timeout:
-            _est_ctx = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
+        _now = time.time()
+        _total_elapsed = _now - _call_start
+        _provider_elapsed = _total_elapsed
+        if agent.api_mode == "codex_responses" and provider_activity["last"] is not None:
+            # The Codex Responses path is streaming internally even though this
+            # wrapper returns only the final response.  Do not kill a healthy
+            # long response just because the worker thread has not returned yet;
+            # only treat it as stale when the provider stream itself has been
+            # quiet for the threshold window.
+            _provider_elapsed = _now - provider_activity["last"]
+        if _provider_elapsed > _stale_timeout:
+            _est_ctx = agent._estimate_non_stream_context_tokens(api_kwargs)
             late_worker_state["stale_killed"] = True
-            late_worker_state["kill_elapsed"] = _elapsed
+            late_worker_state["kill_elapsed"] = _total_elapsed
             late_worker_state["context_tokens"] = _est_ctx
             logger.warning(
-                "Non-streaming API call stale for %.0fs (threshold %.0fs). "
+                "Non-streaming API call stale for %.0fs (threshold %.0fs, total %.0fs, provider_events=%s). "
                 "request_id=%s model=%s context=~%s tokens. Killing connection.",
-                _elapsed, _stale_timeout,
+                _provider_elapsed, _stale_timeout, _total_elapsed, provider_activity["count"],
                 request_id,
                 api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
             )
             agent._emit_status(
-                f"⚠️ No response from provider for {int(_elapsed)}s "
+                f"⚠️ No response from provider for {int(_provider_elapsed)}s "
                 f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
                 f"Aborting call."
             )
@@ -233,13 +247,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
             except Exception:
                 pass
             agent._touch_activity(
-                f"stale non-streaming call killed after {int(_elapsed)}s"
+                f"stale non-streaming call killed after {int(_provider_elapsed)}s"
             )
             # Wait briefly for the thread to notice the closed connection.
             t.join(timeout=2.0)
             if result["error"] is None and result["response"] is None:
                 result["error"] = TimeoutError(
-                    f"Non-streaming API call timed out after {int(_elapsed)}s "
+                    f"Non-streaming API call timed out after {int(_provider_elapsed)}s "
                     f"with no response (threshold: {int(_stale_timeout)}s)"
                 )
             break
@@ -1939,7 +1953,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # when the context is large.  Without this, the stale detector kills
         # healthy connections during the model's thinking phase, producing
         # spurious RemoteProtocolError ("peer closed connection").
-        _est_tokens = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
+        _est_tokens = agent._estimate_non_stream_context_tokens(api_kwargs)
         if _est_tokens > 100_000:
             _stream_stale_timeout = max(_stream_stale_timeout_base, 300.0)
         elif _est_tokens > 50_000:
@@ -1975,7 +1989,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # inner retry loop can start a fresh connection.
         _stale_elapsed = time.time() - last_chunk_time["t"]
         if _stale_elapsed > _stream_stale_timeout:
-            _est_ctx = sum(len(str(v)) for v in api_kwargs.get("messages", [])) // 4
+            _est_ctx = agent._estimate_non_stream_context_tokens(api_kwargs)
             logger.warning(
                 "Stream stale for %.0fs (threshold %.0fs) — no chunks received. "
                 "model=%s context=~%s tokens. Killing connection.",

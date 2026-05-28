@@ -901,14 +901,55 @@ class AIAgent:
 
         return 300.0, True
 
-    def _compute_non_stream_stale_timeout(self, messages: list[dict[str, Any]]) -> float:
+    @staticmethod
+    def _estimate_non_stream_context_tokens(payload: Any) -> int:
+        """Estimate prompt/context tokens for stale-timeout scaling and logs.
+
+        Chat Completions requests carry prompt context in ``messages`` while
+        Responses/Codex requests carry it in ``instructions`` + ``input``.
+        The stale detector receives the final API kwargs, so estimate from the
+        prompt-bearing request fields instead of assuming one transport shape.
+        """
+        def _chars(value: Any) -> int:
+            if value is None:
+                return 0
+            if isinstance(value, str):
+                return len(value)
+            if isinstance(value, bytes):
+                return len(value)
+            if isinstance(value, dict):
+                return sum(len(str(k)) + _chars(v) for k, v in value.items())
+            if isinstance(value, (list, tuple, set)):
+                return sum(_chars(v) for v in value)
+            return len(str(value))
+
+        if isinstance(payload, dict):
+            prompt_fields = {
+                key: payload[key]
+                for key in (
+                    "messages",
+                    "instructions",
+                    "input",
+                    "tools",
+                    "tool_choice",
+                    "parallel_tool_calls",
+                    "reasoning",
+                    "extra_body",
+                )
+                if key in payload
+            }
+            if prompt_fields:
+                return _chars(prompt_fields) // 4
+        return _chars(payload) // 4
+
+    def _compute_non_stream_stale_timeout(self, request_payload: Any) -> float:
         """Compute the effective non-stream stale timeout for this request."""
         stale_base, uses_implicit_default = self._resolved_api_call_stale_timeout_base()
         base_url = getattr(self, "_base_url", None) or self.base_url or ""
         if uses_implicit_default and base_url and is_local_endpoint(base_url):
             return float("inf")
 
-        est_tokens = sum(len(str(v)) for v in messages) // 4
+        est_tokens = AIAgent._estimate_non_stream_context_tokens(request_payload)
         if est_tokens > 100_000:
             return max(stale_base, 600.0)
         if est_tokens > 50_000:
@@ -2539,15 +2580,26 @@ class AIAgent:
     def _close_request_openai_client(self, client: Any, *, reason: str) -> None:
         self._close_openai_client(client, reason=reason, shared=False)
 
-    def _run_codex_stream(self, api_kwargs: dict, client: Any = None, on_first_delta: callable = None):
+    def _run_codex_stream(
+        self,
+        api_kwargs: dict,
+        client: Any = None,
+        on_first_delta: callable = None,
+        on_stream_event: callable = None,
+    ):
         """Forwarder — see ``agent.codex_runtime.run_codex_stream``."""
         from agent.codex_runtime import run_codex_stream
-        return run_codex_stream(self, api_kwargs, client, on_first_delta)
+        return run_codex_stream(self, api_kwargs, client, on_first_delta, on_stream_event)
 
-    def _run_codex_create_stream_fallback(self, api_kwargs: dict, client: Any = None):
+    def _run_codex_create_stream_fallback(
+        self,
+        api_kwargs: dict,
+        client: Any = None,
+        on_stream_event: callable = None,
+    ):
         """Forwarder — see ``agent.codex_runtime.run_codex_create_stream_fallback``."""
         from agent.codex_runtime import run_codex_create_stream_fallback
-        return run_codex_create_stream_fallback(self, api_kwargs, client)
+        return run_codex_create_stream_fallback(self, api_kwargs, client, on_stream_event)
 
     def _try_refresh_codex_client_credentials(self, *, force: bool = True) -> bool:
         if self.api_mode != "codex_responses" or self.provider not in {"openai-codex", "xai-oauth"}:

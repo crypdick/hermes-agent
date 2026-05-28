@@ -420,6 +420,48 @@ class TestBuildCodexClient:
         assert mock_openai.call_count == 2
 
 
+class TestCodexCompletionsAdapter:
+    def test_falls_back_when_sdk_stream_parser_rejects_none_output(self):
+        """Codex auxiliary title generation should recover from SDK output=None parser bugs."""
+
+        class BrokenSDKStream:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def __iter__(self):
+                return iter(())
+
+            def get_final_response(self):
+                raise TypeError("'NoneType' object is not iterable")
+
+        fallback_response = SimpleNamespace(output=None, usage=None)
+        fallback_events = iter([
+            SimpleNamespace(type="response.output_text.delta", delta="Recovered "),
+            SimpleNamespace(type="response.output_text.delta", delta="Title"),
+            SimpleNamespace(type="response.completed", response=fallback_response),
+        ])
+
+        real_client = MagicMock()
+        real_client.responses.stream.return_value = BrokenSDKStream()
+        real_client.responses.create.return_value = fallback_events
+
+        adapter = _CodexCompletionsAdapter(real_client, "gpt-5.4-mini")
+        response = adapter.create(
+            messages=[
+                {"role": "system", "content": "title only"},
+                {"role": "user", "content": "hello"},
+            ],
+            timeout=30,
+        )
+
+        assert response.choices[0].message.content == "Recovered Title"
+        real_client.responses.create.assert_called_once()
+        assert real_client.responses.create.call_args.kwargs["stream"] is True
+
+
 class TestExpiredCodexFallback:
     """Test that expired Codex tokens don't block the auto chain."""
 

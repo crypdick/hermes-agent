@@ -95,6 +95,20 @@ class TestGenerateTitle:
         with patch("agent.title_generator.call_llm", side_effect=RuntimeError("nope")):
             assert generate_title("q", "a") is None
 
+    def test_timeout_invokes_failure_callback(self):
+        """Runtime-health failures in auto-title generation must remain visible."""
+        captured = []
+
+        def _cb(task, exc):
+            captured.append((task, exc))
+
+        exc = TimeoutError("Codex auxiliary Responses stream exceeded 30.0s total timeout")
+        with patch("agent.title_generator.call_llm", side_effect=exc):
+            result = generate_title("question", "answer", failure_callback=_cb)
+
+        assert result is None
+        assert captured == [("title generation", exc)]
+
     def test_truncates_long_messages(self):
         """Long user/assistant messages should be truncated in the LLM request."""
         captured_kwargs = {}
