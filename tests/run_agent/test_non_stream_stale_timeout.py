@@ -1,6 +1,6 @@
 """Regression tests for non-streaming stale timeout behavior."""
 
-import time
+import threading
 from types import SimpleNamespace
 
 from run_agent import AIAgent
@@ -66,16 +66,25 @@ def test_codex_responses_input_count_is_available_for_stale_logging():
     assert tokens > 50_000
 
 
-def test_codex_responses_stream_activity_prevents_outer_non_stream_stale_timeout():
+def test_codex_responses_stream_activity_prevents_outer_non_stream_stale_timeout(monkeypatch):
     """Codex streams internally; provider events must reset the outer stale timer."""
+    import agent.chat_completion_helpers as helpers
+
     events_seen = []
     statuses = []
+    fake_now = {"value": 1_000.0}
+    monkeypatch.setattr(helpers.time, "time", lambda: fake_now["value"])
 
     def run_codex_stream(api_kwargs, client=None, on_first_delta=None, on_stream_event=None):
+        # Advance fake provider time beyond the stale threshold while emitting
+        # stream activity. This avoids wall-clock races while still proving that
+        # Codex SSE events, not only final response completion, keep the outer
+        # non-streaming wrapper alive.
         for _ in range(4):
-            time.sleep(0.14)
+            fake_now["value"] += 0.14
             on_stream_event()
-            events_seen.append(time.monotonic())
+            events_seen.append(fake_now["value"])
+        threading.Event().wait(0.5)
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="ok"))])
 
     agent = SimpleNamespace(
@@ -95,4 +104,5 @@ def test_codex_responses_stream_activity_prevents_outer_non_stream_stale_timeout
 
     assert response.choices[0].message.content == "ok"
     assert len(events_seen) == 4
+    assert events_seen[-1] - 1_000.0 > 0.25
     assert statuses == []
