@@ -33,7 +33,6 @@ def _force_local_terminal(monkeypatch):
 
 
 import sys
-import time
 import threading
 import unittest
 from unittest.mock import patch, MagicMock

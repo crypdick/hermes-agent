@@ -336,13 +336,23 @@ class TestSlackNativeSlashes:
             )
 
     def test_includes_aliases_as_first_class_slashes(self):
-        """Aliases (/btw, /bg, /reset, /q) must be registered as standalone
-        slashes — this is the whole point of native-slashes parity."""
-        names = {n for n, _d, _h in slack_native_slashes()}
+        """Aliases (/btw, /bg, /reset, …) must be registered as standalone
+        slashes — this is the whole point of native-slashes parity.
+
+        Asserts the contract (aliases are surfaced as first-class slashes),
+        not a specific alias's survival of Slack's 50-slash clamp — which alias
+        lands last shifts whenever a canonical command is added, so pinning one
+        name (previously ``q``) made this a change-detector.
+        """
+        slashes = slack_native_slashes()
+        names = {n for n, _d, _h in slashes}
+        # Aliases that sort early in the registry always fit under the cap.
         assert "btw" in names
         assert "bg" in names
         assert "reset" in names
-        assert "q" in names
+        # And at least one alias is surfaced as an alias entry (description
+        # carries the "Alias for /…" marker), proving the alias pass ran.
+        assert any(d.startswith("Alias for /") for _n, d, _h in slashes)
 
     def test_telegram_parity(self):
         """Every Telegram bot command must be registerable on Slack too.
@@ -951,6 +961,30 @@ class TestTelegramMenuCommands:
                 f"Command '{name}' is {len(name)} chars (limit {_TG_NAME_LIMIT})"
             )
 
+    def test_operational_builtins_survive_thirty_command_cap(self, tmp_path, monkeypatch):
+        (tmp_path / "config.yaml").write_text(
+            "display:\n  tool_progress_command: true\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        menu, hidden = telegram_menu_commands(max_commands=30)
+        names = [name for name, _desc in menu]
+
+        assert len(names) == 30
+        assert hidden > 0
+        for name in (
+            "debug",
+            "restart",
+            "update",
+            "verbose",
+            "commands",
+            "help",
+            "new",
+            "stop",
+            "status",
+        ):
+            assert name in names
+
     def test_includes_plugin_commands_via_lazy_discovery(self, tmp_path, monkeypatch):
         """Telegram menu generation should discover plugin slash commands on first access."""
         from unittest.mock import patch
@@ -979,7 +1013,7 @@ class TestTelegramMenuCommands:
 
     def test_excludes_telegram_disabled_skills(self, tmp_path, monkeypatch):
         """Skills disabled for telegram should not appear in the menu."""
-        from unittest.mock import patch, MagicMock
+        from unittest.mock import patch
 
         # Set up a config with a telegram-specific disabled list
         config_file = tmp_path / "config.yaml"
