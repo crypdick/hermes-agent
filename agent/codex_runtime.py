@@ -205,6 +205,10 @@ def run_codex_stream(
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
         collected_output_items: list = []
+        # Latest Response snapshot the SDK exposes via event.response.
+        # Used to recover a real Response (with usage/id) if
+        # get_final_response() raises instead of returning empty output.
+        streamed_response = None
         try:
             with active_client.responses.stream(**api_kwargs) as stream:
                 for event in stream:
@@ -217,6 +221,9 @@ def run_codex_stream(
                     if agent._interrupt_requested:
                         break
                     event_type = getattr(event, "type", "")
+                    _resp_snapshot = getattr(event, "response", None)
+                    if _resp_snapshot is not None:
+                        streamed_response = _resp_snapshot
                     # Fire callbacks on text content deltas (suppress during tool calls)
                     if "output_text.delta" in event_type or event_type == "response.output_text.delta":
                         delta_text = getattr(event, "delta", "")
@@ -302,6 +309,38 @@ def run_codex_stream(
             return _fallback_with_optional_stream_event()
         except TypeError as exc:
             if "NoneType" in str(exc) and "iterable" in str(exc):
+                # openai>=2.x get_final_response() RAISES this (instead of
+                # returning an empty-output Response) for the chatgpt.com
+                # backend-api/codex stream. The output items already arrived via
+                # response.output_item.done and we captured the Response snapshot
+                # from event.response — recover from those instead of re-issuing
+                # the whole request via create(stream=True) (double token cost,
+                # and the fallback can hit the same NoneType failure).
+                if streamed_response is not None and (
+                    collected_output_items
+                    or (agent._codex_streamed_text_parts and not has_tool_calls)
+                ):
+                    if collected_output_items:
+                        streamed_response.output = list(collected_output_items)
+                        logger.debug(
+                            "Codex stream: recovered final response from %d streamed "
+                            "output items after get_final_response NoneType",
+                            len(collected_output_items),
+                        )
+                    else:
+                        assembled = "".join(agent._codex_streamed_text_parts)
+                        streamed_response.output = [SimpleNamespace(
+                            type="message",
+                            role="assistant",
+                            status="completed",
+                            content=[SimpleNamespace(type="output_text", text=assembled)],
+                        )]
+                        logger.debug(
+                            "Codex stream: recovered final response from %d streamed "
+                            "text deltas (%d chars) after get_final_response NoneType",
+                            len(agent._codex_streamed_text_parts), len(assembled),
+                        )
+                    return streamed_response
                 logger.warning(
                     "Codex Responses stream SDK parse failed on output=None; falling back to create(stream=True). %s err=%s",
                     agent._client_log_context(),

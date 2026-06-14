@@ -1965,3 +1965,64 @@ def test_preflight_codex_input_deduplicates_reasoning_ids(monkeypatch):
     # IDs must be stripped — with store=False the API 404s on id lookups.
     for it in reasoning_items:
         assert "id" not in it
+
+
+def test_run_codex_stream_recovers_from_get_final_response_nonetype(monkeypatch):
+    """Regression: openai>=2.x raises ``TypeError('NoneType' object is not
+    iterable)`` from ``get_final_response()`` for the chatgpt.com backend-api/codex
+    stream, even though valid output items already arrived via
+    ``response.output_item.done``. We must recover the final response from those
+    collected items instead of re-issuing the entire request via
+    ``create(stream=True)`` (double token cost + the fallback can itself fail)."""
+    agent = _build_agent(monkeypatch)
+    calls = {"stream": 0, "create": 0}
+
+    done_item = SimpleNamespace(
+        type="message",
+        content=[SimpleNamespace(type="output_text", text="recovered ok")],
+    )
+    # Backend snapshot the SDK exposes via event.response: usage present,
+    # but output is None (the shape that makes get_final_response() throw).
+    empty_snapshot = SimpleNamespace(
+        output=None,
+        usage=SimpleNamespace(input_tokens=7, output_tokens=2, total_tokens=9),
+        status="completed",
+        model="gpt-5-codex",
+    )
+    events = [
+        SimpleNamespace(type="response.created", response=empty_snapshot),
+        SimpleNamespace(type="response.output_item.done", item=done_item),
+        SimpleNamespace(type="response.completed", response=empty_snapshot),
+    ]
+
+    class _ThrowingStream:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def __iter__(self):
+            return iter(events)
+
+        def get_final_response(self):
+            raise TypeError("'NoneType' object is not iterable")
+
+    def _fake_stream(**kwargs):
+        calls["stream"] += 1
+        return _ThrowingStream()
+
+    def _fake_create(**kwargs):
+        calls["create"] += 1
+        return _codex_message_response("create fallback")
+
+    agent.client = SimpleNamespace(
+        responses=SimpleNamespace(stream=_fake_stream, create=_fake_create)
+    )
+
+    response = agent._run_codex_stream(_codex_request_kwargs())
+
+    assert calls["create"] == 0, "must NOT re-issue request via create() fallback"
+    assert calls["stream"] == 1
+    assert response.output[0].content[0].text == "recovered ok"
+    assert response.usage.total_tokens == 9  # real Response object preserved
