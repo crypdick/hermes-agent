@@ -1549,6 +1549,19 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             )
             if hasattr(agent, "interrupt"):
                 agent.interrupt("Cron job timed out (inactivity)")
+            # On a cron inactivity-timeout, dump every thread's Python stack
+            # so the hang site is self-evident (e.g. a lock acquire or a
+            # blocking read with no heartbeat) without needing py-spy/root.
+            # Goes to stderr -> gateway.error.log.
+            try:
+                import faulthandler as _fh, sys as _sys
+                print(
+                    "=== CRON TIMEOUT THREAD DUMP: %s ===" % job_name,
+                    file=_sys.stderr, flush=True,
+                )
+                _fh.dump_traceback(file=_sys.stderr, all_threads=True)
+            except Exception:
+                pass
             raise TimeoutError(
                 f"Cron job '{job_name}' idle for "
                 f"{int(_secs_ago)}s (limit {int(_cron_inactivity_limit)}s) "

@@ -16,12 +16,48 @@ Inspired by Block/goose's SubdirectoryHintTracker.
 import logging
 import os
 import shlex
+import threading
 from pathlib import Path
 from typing import Dict, Any, Optional, Set
 
 from agent.prompt_builder import _scan_context_content
 
 logger = logging.getLogger(__name__)
+
+# A best-effort hint read must never block the agent turn.  A hint file on
+# a half-synced / stale / provider-backed path can make open()/read() hang
+# indefinitely while stat() (is_file) still succeeds — observed wedging a
+# cron turn until the 600s inactivity killer fired.  Read in a daemon thread
+# and abandon it on timeout (leaks at most one blocked thread until the FS
+# recovers, far better than hanging the whole turn).
+_HINT_READ_TIMEOUT_DEFAULT = 3.0
+
+
+def _read_text_bounded(path: Path, timeout: float):
+    """Read text from ``path``, returning None if it takes longer than
+    ``timeout`` seconds or errors."""
+    result = {}
+
+    def _worker():
+        try:
+            result["text"] = path.read_text(encoding="utf-8")
+        except Exception as exc:  # noqa: BLE001 — best-effort
+            result["err"] = exc
+
+    t = threading.Thread(target=_worker, daemon=True, name="hint-read")
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        logger.warning(
+            "Hint file read exceeded %.1fs, skipping (possible stale/slow "
+            "path): %s",
+            timeout, path,
+        )
+        return None
+    if "err" in result:
+        logger.debug("Could not read %s: %s", path, result["err"])
+        return None
+    return result.get("text")
 
 # Context files to look for in subdirectories, in priority order.
 # Same filenames as prompt_builder.py but we load ALL found (not first-wins)
@@ -180,8 +216,14 @@ class SubdirectoryHintTracker:
                     continue
             except OSError:
                 continue
+            _hint_timeout = float(
+                os.getenv("HERMES_HINT_READ_TIMEOUT", str(_HINT_READ_TIMEOUT_DEFAULT))
+            )
+            _raw = _read_text_bounded(hint_path, _hint_timeout)
+            if _raw is None:
+                continue
             try:
-                content = hint_path.read_text(encoding="utf-8").strip()
+                content = _raw.strip()
                 if not content:
                     continue
                 # Same security scan as startup context loading
