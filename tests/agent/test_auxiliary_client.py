@@ -490,6 +490,7 @@ class TestExpiredCodexFallback:
 
         # Set up Anthropic as fallback
         monkeypatch.setenv("ANTHROPIC_TOKEN", "sk-ant-oat01-test-fallback")
+        monkeypatch.setattr("agent.auxiliary_client._refresh_provider_credentials", lambda *_a, **_k: False)
         with patch("agent.anthropic_adapter.build_anthropic_client") as mock_build:
             mock_build.return_value = MagicMock()
             from agent.auxiliary_client import _resolve_auto, AnthropicAuxiliaryClient
@@ -520,6 +521,7 @@ class TestExpiredCodexFallback:
         }))
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-test-key")
+        monkeypatch.setattr("agent.auxiliary_client._refresh_provider_credentials", lambda *_a, **_k: False)
 
         with patch("agent.auxiliary_client.OpenAI") as mock_openai:
             mock_openai.return_value = MagicMock()
@@ -550,6 +552,7 @@ class TestExpiredCodexFallback:
             },
         }))
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setattr("agent.auxiliary_client._refresh_provider_credentials", lambda *_a, **_k: False)
 
         # Simulate Ollama or custom endpoint
         with patch("agent.auxiliary_client._resolve_custom_runtime",
@@ -3033,3 +3036,47 @@ class TestAuxUnhealthyCache:
             )
             # After the 402, OpenRouter is in the unhealthy cache.
             assert _is_provider_unhealthy("openrouter") is True
+
+
+
+def test_resolve_auto_refreshes_expired_main_provider_then_retries(monkeypatch):
+    """Regression: when the main (codex) provider resolves to None because its
+    short-lived OAuth token just expired, _resolve_auto must refresh the
+    credential and retry the SAME provider before falling through to the
+    Step-2 chain. For codex-only setups that chain is empty, so without this a
+    brief token-expiry window collapses ALL auxiliary capability (compression,
+    summarization, memory flush)."""
+    import agent.auxiliary_client as ax
+    from unittest.mock import MagicMock
+
+    monkeypatch.setattr(
+        ax, "_normalize_main_runtime",
+        lambda r: {"provider": "openai-codex", "model": "gpt-5.5",
+                   "base_url": "", "api_key": "", "api_mode": ""},
+    )
+    monkeypatch.setattr(ax, "_is_provider_unhealthy", lambda label: False)
+    # Empty Step-2 chain — the codex-only reality this fix targets.
+    monkeypatch.setattr(ax, "_get_provider_chain", lambda: [])
+
+    calls = {"resolve": 0, "refresh": 0}
+    good_client = MagicMock()
+
+    def _fake_resolve(provider, model, **kwargs):
+        calls["resolve"] += 1
+        if calls["resolve"] == 1:
+            return None, None  # expired token on first attempt
+        return good_client, model  # succeeds after refresh
+
+    def _fake_refresh(provider):
+        calls["refresh"] += 1
+        return provider == "openai-codex"
+
+    monkeypatch.setattr(ax, "resolve_provider_client", _fake_resolve)
+    monkeypatch.setattr(ax, "_refresh_provider_credentials", _fake_refresh)
+
+    client, model = ax._resolve_auto()
+
+    assert client is good_client, "must refresh + retry codex, not fall through"
+    assert model == "gpt-5.5"
+    assert calls["refresh"] == 1
+    assert calls["resolve"] == 2

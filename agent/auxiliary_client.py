@@ -2898,6 +2898,28 @@ def _resolve_auto(main_runtime: Optional[Dict[str, Any]] = None) -> Tuple[Option
                 logger.info("Auxiliary auto-detect: using main provider %s (%s)",
                             main_provider, resolved or main_model)
                 return client, resolved or main_model
+            # The main provider can transiently resolve to None when its
+            # short-lived OAuth token (codex / xai / nous) has expired.
+            # Before falling through to the Step-2 chain — which is EMPTY
+            # for users who rely solely on the main provider for side
+            # tasks — refresh the credential once and retry the same
+            # provider. Without this, a brief token-expiry window collapses
+            # all auxiliary capability (compression, summarization, memory
+            # flush) even though codex is otherwise healthy.
+            if client is None and _refresh_provider_credentials(resolved_provider):
+                client, resolved = resolve_provider_client(
+                    resolved_provider,
+                    main_model,
+                    explicit_base_url=explicit_base_url,
+                    explicit_api_key=explicit_api_key,
+                    api_mode=runtime_api_mode or None,
+                )
+                if client is not None:
+                    logger.info(
+                        "Auxiliary auto-detect: using main provider %s after "
+                        "credential refresh (%s)",
+                        main_provider, resolved or main_model)
+                    return client, resolved or main_model
 
     # ── Step 2: aggregator / fallback chain ──────────────────────────────
     tried = []
