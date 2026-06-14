@@ -498,6 +498,7 @@ def run_conversation(
     if agent._memory_manager:
         try:
             _turn_msg = original_user_message if isinstance(original_user_message, str) else ""
+            agent._touch_activity("memory on_turn_start")
             agent._memory_manager.on_turn_start(agent._user_turn_count, _turn_msg)
         except Exception:
             pass
@@ -511,7 +512,19 @@ def run_conversation(
     if agent._memory_manager:
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
+            # Label activity before prefetch so a stall here surfaces as
+            # last_activity="memory prefetch" instead of ambiguous
+            # "initializing" (diagnoses cron Mode-B idle-timeouts).
+            agent._touch_activity("memory prefetch")
+            _prefetch_t0 = time.monotonic()
             _ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+            _prefetch_dt = time.monotonic() - _prefetch_t0
+            if _prefetch_dt > 10.0:
+                logger.warning(
+                    "memory prefetch_all took %.1fs (cron inactivity limit "
+                    "%ss; slow recall can stall a scheduled turn)",
+                    _prefetch_dt, os.getenv("HERMES_CRON_TIMEOUT", "600"),
+                )
         except Exception:
             pass
 
