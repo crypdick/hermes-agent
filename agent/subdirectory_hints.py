@@ -16,10 +16,10 @@ Inspired by Block/goose's SubdirectoryHintTracker.
 import logging
 import os
 import shlex
-import threading
 from pathlib import Path
 from typing import Dict, Any, Optional, Set
 
+from agent.bounded_file_io import read_text_bounded
 from agent.prompt_builder import _scan_context_content
 
 logger = logging.getLogger(__name__)
@@ -36,28 +36,12 @@ _HINT_READ_TIMEOUT_DEFAULT = 3.0
 def _read_text_bounded(path: Path, timeout: float):
     """Read text from ``path``, returning None if it takes longer than
     ``timeout`` seconds or errors."""
-    result = {}
-
-    def _worker():
-        try:
-            result["text"] = path.read_text(encoding="utf-8")
-        except Exception as exc:  # noqa: BLE001 — best-effort
-            result["err"] = exc
-
-    t = threading.Thread(target=_worker, daemon=True, name="hint-read")
-    t.start()
-    t.join(timeout)
-    if t.is_alive():
-        logger.warning(
-            "Hint file read exceeded %.1fs, skipping (possible stale/slow "
-            "path): %s",
-            timeout, path,
-        )
-        return None
-    if "err" in result:
-        logger.debug("Could not read %s: %s", path, result["err"])
-        return None
-    return result.get("text")
+    return read_text_bounded(
+        path,
+        timeout,
+        logger=logger,
+        operation="Hint file read",
+    )
 
 # Context files to look for in subdirectories, in priority order.
 # Same filenames as prompt_builder.py but we load ALL found (not first-wins)

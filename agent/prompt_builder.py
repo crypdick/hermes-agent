@@ -15,6 +15,13 @@ from pathlib import Path
 from hermes_constants import get_hermes_home, get_skills_dir, is_wsl
 from typing import Optional
 
+from agent.bounded_file_io import (
+    glob_bounded,
+    path_exists_bounded,
+    path_is_dir_bounded,
+    path_is_file_bounded,
+    read_text_bounded,
+)
 from agent.skill_utils import (
     extract_skill_conditions,
     extract_skill_description,
@@ -27,6 +34,8 @@ from agent.skill_utils import (
 from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
+
+_CONTEXT_FILE_READ_TIMEOUT_DEFAULT = 3.0
 
 # ---------------------------------------------------------------------------
 # Context file scanning — detect prompt injection in AGENTS.md, .cursorrules,
@@ -80,8 +89,14 @@ def _find_git_root(start: Path) -> Optional[Path]:
     filesystem root without finding one.
     """
     current = start.resolve()
+    timeout = _context_file_read_timeout()
     for parent in [current, *current.parents]:
-        if (parent / ".git").exists():
+        if path_exists_bounded(
+            parent / ".git",
+            timeout,
+            logger=logger,
+            operation="Context git-root check",
+        ):
             return parent
     return None
 
@@ -98,11 +113,17 @@ def _find_hermes_md(cwd: Path) -> Optional[Path]:
     """
     stop_at = _find_git_root(cwd)
     current = cwd.resolve()
+    timeout = _context_file_read_timeout()
 
     for directory in [current, *current.parents]:
         for name in _HERMES_MD_NAMES:
             candidate = directory / name
-            if candidate.is_file():
+            if path_is_file_bounded(
+                candidate,
+                timeout,
+                logger=logger,
+                operation="Context file stat",
+            ):
                 return candidate
         # Stop walking at the git root (or filesystem root).
         if stop_at and directory == stop_at:
@@ -125,6 +146,71 @@ def _strip_yaml_frontmatter(content: str) -> str:
             body = content[end + 4:].lstrip("\n")
             return body if body else content
     return content
+
+
+def _context_file_read_timeout() -> float:
+    raw = os.getenv(
+        "HERMES_CONTEXT_FILE_READ_TIMEOUT",
+        str(_CONTEXT_FILE_READ_TIMEOUT_DEFAULT),
+    )
+    try:
+        timeout = float(raw)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid HERMES_CONTEXT_FILE_READ_TIMEOUT=%r; using %.1fs",
+            raw,
+            _CONTEXT_FILE_READ_TIMEOUT_DEFAULT,
+        )
+        return _CONTEXT_FILE_READ_TIMEOUT_DEFAULT
+    if timeout <= 0:
+        logger.warning(
+            "HERMES_CONTEXT_FILE_READ_TIMEOUT must be positive; using %.1fs",
+            _CONTEXT_FILE_READ_TIMEOUT_DEFAULT,
+        )
+        return _CONTEXT_FILE_READ_TIMEOUT_DEFAULT
+    return timeout
+
+
+def _read_context_file(path: Path) -> Optional[str]:
+    return read_text_bounded(
+        path,
+        _context_file_read_timeout(),
+        logger=logger,
+        operation="Context file read",
+    )
+
+
+def _context_file_exists(path: Path) -> bool:
+    return bool(
+        path_exists_bounded(
+            path,
+            _context_file_read_timeout(),
+            logger=logger,
+            operation="Context file exists check",
+        )
+    )
+
+
+def _context_is_file(path: Path) -> bool:
+    return bool(
+        path_is_file_bounded(
+            path,
+            _context_file_read_timeout(),
+            logger=logger,
+            operation="Context file stat",
+        )
+    )
+
+
+def _context_is_dir(path: Path) -> bool:
+    return bool(
+        path_is_dir_bounded(
+            path,
+            _context_file_read_timeout(),
+            logger=logger,
+            operation="Context directory stat",
+        )
+    )
 
 
 # =========================================================================
@@ -1317,10 +1403,13 @@ def load_soul_md() -> Optional[str]:
         logger.debug("Could not ensure HERMES_HOME before loading SOUL.md: %s", e)
 
     soul_path = get_hermes_home() / "SOUL.md"
-    if not soul_path.exists():
+    if not _context_file_exists(soul_path):
         return None
     try:
-        content = soul_path.read_text(encoding="utf-8").strip()
+        raw = _read_context_file(soul_path)
+        if raw is None:
+            return None
+        content = raw.strip()
         if not content:
             return None
         content = _scan_context_content(content, "SOUL.md")
@@ -1337,7 +1426,10 @@ def _load_hermes_md(cwd_path: Path) -> str:
     if not hermes_md_path:
         return ""
     try:
-        content = hermes_md_path.read_text(encoding="utf-8").strip()
+        raw = _read_context_file(hermes_md_path)
+        if raw is None:
+            return ""
+        content = raw.strip()
         if not content:
             return ""
         content = _strip_yaml_frontmatter(content)
@@ -1358,9 +1450,12 @@ def _load_agents_md(cwd_path: Path) -> str:
     """AGENTS.md — top-level only (no recursive walk)."""
     for name in ["AGENTS.md", "agents.md"]:
         candidate = cwd_path / name
-        if candidate.exists():
+        if _context_is_file(candidate):
             try:
-                content = candidate.read_text(encoding="utf-8").strip()
+                raw = _read_context_file(candidate)
+                if raw is None:
+                    continue
+                content = raw.strip()
                 if content:
                     content = _scan_context_content(content, name)
                     result = f"## {name}\n\n{content}"
@@ -1374,9 +1469,12 @@ def _load_claude_md(cwd_path: Path) -> str:
     """CLAUDE.md / claude.md — cwd only."""
     for name in ["CLAUDE.md", "claude.md"]:
         candidate = cwd_path / name
-        if candidate.exists():
+        if _context_is_file(candidate):
             try:
-                content = candidate.read_text(encoding="utf-8").strip()
+                raw = _read_context_file(candidate)
+                if raw is None:
+                    continue
+                content = raw.strip()
                 if content:
                     content = _scan_context_content(content, name)
                     result = f"## {name}\n\n{content}"
@@ -1390,9 +1488,10 @@ def _load_cursorrules(cwd_path: Path) -> str:
     """.cursorrules + .cursor/rules/*.mdc — cwd only."""
     cursorrules_content = ""
     cursorrules_file = cwd_path / ".cursorrules"
-    if cursorrules_file.exists():
+    if _context_is_file(cursorrules_file):
         try:
-            content = cursorrules_file.read_text(encoding="utf-8").strip()
+            raw = _read_context_file(cursorrules_file)
+            content = raw.strip() if raw is not None else ""
             if content:
                 content = _scan_context_content(content, ".cursorrules")
                 cursorrules_content += f"## .cursorrules\n\n{content}\n\n"
@@ -1400,11 +1499,23 @@ def _load_cursorrules(cwd_path: Path) -> str:
             logger.debug("Could not read .cursorrules: %s", e)
 
     cursor_rules_dir = cwd_path / ".cursor" / "rules"
-    if cursor_rules_dir.exists() and cursor_rules_dir.is_dir():
-        mdc_files = sorted(cursor_rules_dir.glob("*.mdc"))
+    if _context_is_dir(cursor_rules_dir):
+        mdc_files = sorted(
+            glob_bounded(
+                cursor_rules_dir,
+                "*.mdc",
+                _context_file_read_timeout(),
+                logger=logger,
+                operation="Context cursor rules glob",
+            )
+            or []
+        )
         for mdc_file in mdc_files:
             try:
-                content = mdc_file.read_text(encoding="utf-8").strip()
+                raw = _read_context_file(mdc_file)
+                if raw is None:
+                    continue
+                content = raw.strip()
                 if content:
                     content = _scan_context_content(content, f".cursor/rules/{mdc_file.name}")
                     cursorrules_content += f"## .cursor/rules/{mdc_file.name}\n\n{content}\n\n"
